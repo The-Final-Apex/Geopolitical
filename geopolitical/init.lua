@@ -6,7 +6,38 @@
 -- - Random perks assigned on spawn/respawn
 -- - Country interactions (peace, trade, non-aggression, etc.)
 -- - Organizations that transcend countries
+-- Default mod fallbacks
+function table.contains(tbl, val)
+    for _, v in ipairs(tbl) do
+        if v == val then
+            return true
+        end
+    end
+    return false
+end
 
+local default_mod = minetest.get_modpath("default")
+local default = {
+    node_sound_metal_defaults = function()
+        return {
+            footstep = {name = "default_metal_footstep", gain = 0.4},
+            dig = {name = "default_dig_metal", gain = 0.5},
+            dug = {name = "default_dug_metal", gain = 1.0}
+        }
+    end
+}
+
+if not default_mod then
+    default = {
+        node_sound_metal_defaults = function()
+            return {
+                footstep = {name = "geopolitical_metal_footstep", gain = 0.4},
+                dig = {name = "geopolitical_dig_metal", gain = 0.5},
+                dug = {name = "geopolitical_dug_metal", gain = 1.0}
+            }
+        end
+    }
+end
 local vector = vector
 local math = math
 local table = table
@@ -467,6 +498,205 @@ else
     }
 end
 
+
+-- Add to your BUILDINGS table after existing definitions
+geopolitical.BUILDINGS = {
+    -- ... (your existing buildings) ...
+    
+    -- Military Buildings
+    {
+        id = "military_base",
+        name = "Military Base",
+        description = "Trains soldiers and enables advanced units",
+        cost = {gold = 500, iron = 1000, food = 200},
+        roles = {"engineer", "president"},
+        size = {x = 7, y = 4, z = 7},
+        node = "default:steelblock",
+        texture = "geopolitical_military_base.png",
+        tech_required = 1,
+        limit = 2,
+        bonus = {military = true}
+    },
+    {
+        id = "missile_silo",
+        name = "Missile Silo", 
+        description = "Allows construction of nuclear missiles",
+        cost = {gold = 1000, iron = 2000, food = 100},
+        roles = {"engineer", "president"},
+        size = {x = 5, y = 8, z = 5},
+        node = "default:obsidian",
+        texture = "geopolitical_missile_silo.png",
+        tech_required = 3,
+        requires = "military_base",
+        limit = 1,
+        bonus = {missiles = true}
+    },
+    {
+        id = "research_lab",
+        name = "Research Lab",
+        description = "Increases technology progression",
+        cost = {gold = 800, iron = 500, food = 300},
+        roles = {"engineer", "scientist"},
+        size = {x = 5, y = 4, z = 5},
+        node = "default:glass",
+        texture = "geopolitical_research_lab.png",
+        tech_required = 2,
+        limit = 1,
+        generate = {tech = 0.1} -- Generates tech points
+    }
+}
+
+-- Technology System
+geopolitical.technology = {
+    levels = {
+        {level = 1, name = "Industrial", required_points = 100},
+        {level = 2, name = "Modern", required_points = 300},
+        {level = 3, name = "Nuclear", required_points = 800},
+        {level = 4, name = "Space Age", required_points = 1500}
+    },
+    recipes = {
+        nuclear_reactor = {
+            output = "geopolitical:nuclear_core",
+            secret = true,
+            recipe = {
+                {"geopolitical:uranium", "default:steelblock", "geopolitical:uranium"},
+                {"default:mese_crystal", "default:diamondblock", "default:mese_crystal"},
+                {"geopolitical:uranium", "default:steelblock", "geopolitical:uranium"}
+            },
+            tech_points = 50,
+            tech_required = 3
+        },
+        super_computer = {
+            output = "geopolitical:super_computer",
+            secret = true,
+            recipe = {
+                {"default:mese_crystal", "default:goldblock", "default:mese_crystal"},
+                {"default:diamond", "default:copper_ingot", "default:diamond"},
+                {"default:mese_crystal", "default:goldblock", "default:mese_crystal"}
+            },
+            tech_points = 30,
+            tech_required = 2
+        }
+    }
+}
+
+-- Add to country initialization
+for _, country in pairs(geopolitical.countries) do
+    country.tech = {
+        level = 0,
+        points = 0,
+        unlocked = {}
+    }
+end
+
+-- Technology crafting handler
+minetest.register_on_craft(function(itemstack, player, old_craft_grid, craft_inv)
+    local player_name = player:get_player_name()
+    local player_data = geopolitical.players[player_name]
+    if not player_data then return end
+    
+    local country = geopolitical.countries[player_data.country]
+    if not country then return end
+    
+    -- Check if crafted item is a tech recipe
+    for tech_id, recipe in pairs(geopolitical.technology.recipes) do
+        if itemstack:get_name() == recipe.output then
+            -- Check tech level requirement
+            if country.tech.level < recipe.tech_required then
+                minetest.chat_send_player(player_name, 
+                    "Technology level too low! Need level "..recipe.tech_required)
+                return itemstack -- Prevent crafting
+            end
+            
+            -- Award tech points
+            country.tech.points = country.tech.points + (recipe.tech_points or 0)
+            minetest.chat_send_player(player_name, 
+                "Earned "..(recipe.tech_points or 0).." tech points!")
+            
+            -- Check for level up
+            for _, level in ipairs(geopolitical.technology.levels) do
+                if country.tech.points >= level.required_points and 
+                   country.tech.level < level.level then
+                    country.tech.level = level.level
+                    minetest.chat_send_all(player_data.country.." has reached "..
+                        level.name.." technology!")
+                    break
+                end
+            end
+        end
+    end
+end)
+
+-- Secret recipe discovery system
+minetest.register_on_player_receive_fields(function(player, formname, fields)
+    if formname == "geopolitical:research" then
+        local player_name = player:get_player_name()
+        local player_data = geopolitical.players[player_name]
+        if not player_data then return end
+        
+        local country = geopolitical.countries[player_data.country]
+        if not country then return end
+        
+        for tech_id, _ in pairs(fields) do
+            if geopolitical.technology.recipes[tech_id] and
+               country.tech.level >= geopolitical.technology.recipes[tech_id].tech_required then
+                country.tech.unlocked[tech_id] = true
+                minetest.chat_send_player(player_name, 
+                    "Discovered "..tech_id.." technology!")
+            end
+        end
+    end
+end)
+
+-- Research command
+minetest.register_chatcommand("research", {
+    description = "View available research projects",
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "Player not found" end
+        
+        local player_data = geopolitical.players[name]
+        if not player_data then return false, "Player data not found" end
+        
+        local country = geopolitical.countries[player_data.country]
+        if not country then return false, "Country not found" end
+        
+        local formspec = "size[8,10]label[0.5,0.5;Research Projects]"..
+                         "label[0.5,1;Current Tech Level: "..country.tech.level.."]"..
+                         "label[0.5,1.5;Tech Points: "..country.tech.points.."]"
+        local y = 2
+        for tech_id, recipe in pairs(geopolitical.technology.recipes) do
+            if country.tech.level >= recipe.tech_required and
+               not country.tech.unlocked[tech_id] then
+                formspec = formspec.."button[0.5,"..y..";7,1;"..tech_id..";Research "..tech_id.."]"
+                y = y + 1
+            end
+        end
+        
+        minetest.show_formspec(name, "geopolitical:research", formspec)
+        return true
+    end
+})
+
+-- Custom tech items
+minetest.register_craftitem("geopolitical:nuclear_core", {
+    description = "Nuclear Reactor Core\nHighly advanced technology",
+    inventory_image = "geopolitical_nuclear_core.png",
+    groups = {tech_item = 1, radioactive = 1}
+})
+
+minetest.register_craftitem("geopolitical:super_computer", {
+    description = "Super Computer\nIncreases research speed",
+    inventory_image = "geopolitical_super_computer.png",
+    groups = {tech_item = 1}
+})
+
+minetest.register_craftitem("geopolitical:uranium", {
+    description = "Uranium Ore\nHandle with care",
+    inventory_image = "geopolitical_uranium.png",
+    groups = {radioactive = 1}
+})
+
 -- Register the repair kit node
 minetest.register_node("geopolitical:repair_kit", {
     description = S("Building Repair Kit") .. "\n" .. S("Place in damaged building to repair"),
@@ -578,7 +808,70 @@ minetest.register_node("geopolitical:repair_kit", {
         return itemstack
     end
 })
-
+-- Register building items for each building type
+for _, building_def in ipairs(geopolitical.BUILDINGS) do
+    minetest.register_node("geopolitical:building_"..building_def.id, {
+        description = building_def.name.."\n"..building_def.description,
+        tiles = {building_def.texture},
+        groups = {dig_immediate = 2, building_kit = 1},
+        stack_max = 1,
+        
+        on_place = function(itemstack, placer, pointed_thing)
+            if pointed_thing.type ~= "node" then return end
+            
+            local pos = pointed_thing.above
+            local player_name = placer:get_player_name()
+            local player_data = geopolitical.players[player_name]
+            
+            -- Check permissions
+            if not player_data then return end
+            if not table.contains(building_def.roles, player_data.role) then
+                minetest.chat_send_player(player_name, "Your role can't build this!")
+                return
+            end
+            
+            -- Check country resources
+            local country = geopolitical.countries[player_data.country]
+            for res, amount in pairs(building_def.cost) do
+                if (country.resources[res] or 0) < amount then
+                    minetest.chat_send_player(player_name, 
+                        "Not enough "..res.." (need "..amount..")")
+                    return
+                end
+            end
+            
+            -- Deduct resources
+            for res, amount in pairs(building_def.cost) do
+                country.resources[res] = country.resources[res] - amount
+            end
+            
+            -- Create building structure
+            local half_x = math.floor(building_def.size.x / 2)
+            local half_z = math.floor(building_def.size.z / 2)
+            
+            for x = -half_x, half_x do
+                for y = 0, building_def.size.y-1 do
+                    for z = -half_z, half_z do
+                        local place_pos = vector.add(pos, {x=x, y=y, z=z})
+                        
+                        -- Skip corners for door openings
+                        if not (x == 0 and z == 0 and y <= 1) then
+                            minetest.set_node(place_pos, {name=building_def.node})
+                        end
+                    end
+                end
+            end
+            
+            -- Add special nodes
+            minetest.set_node(pos, {name="air"}) -- Entrance
+            minetest.set_node(vector.add(pos, {y=1}), {name="air"}) -- Doorway
+            
+            minetest.chat_send_player(player_name, building_def.name.." built!")
+            itemstack:take_item()
+            return itemstack
+        end
+    })
+end
 -- Craft recipe for repair kit (with fallbacks)
 local steel_ingot = minetest.registered_items["default:steel_ingot"] and "default:steel_ingot" or "geopolitical:steel_ingot"
 local gold_ingot = minetest.registered_items["default:gold_ingot"] and "default:gold_ingot" or "geopolitical:gold_ingot"
