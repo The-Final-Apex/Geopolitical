@@ -449,456 +449,416 @@ minetest.after(0, function()
 end)
 
 minetest.log("action", "[Geopolitical] System initialized")
+-- Repair System
+-- Repair System Implementation
 
--- Add to your existing geopolitical.lua file
+-- First, define our own nodes and sounds if default mod isn't available
+local S = minetest.get_translator("geopolitical")
 
--- Building Definitions
-geopolitical.BUILDINGS = {
-    {
-        id = "farm",
-        name = "Farm",
-        description = "Generates food for your country",
-        cost = {gold = 50, iron = 20, food = 10},
-        roles = {"engineer", "president"},
-        generate = {food = 2},
-        interval = 60,
-        size = {x = 3, y = 2, z = 3},
-        node = "farming:soil_wet",
-        texture = "default_grass.png",
-        limit = 5
-    },
-    {
-        id = "mine",
-        name = "Mine",
-        description = "Generates iron and gold for your country",
-        cost = {gold = 30, iron = 50, food = 5},
-        roles = {"engineer", "president"},
-        generate = {iron = 1, gold = 0.5},
-        interval = 90,
-        size = {x = 3, y = 3, z = 3},
-        node = "default:stone",
-        texture = "default_stone.png",
-        limit = 3
-    },
-    {
-        id = "trade_center",
-        name = "Trade Center",
-        description = "Increases gold generation and enables foreign trade",
-        cost = {gold = 200, iron = 100, food = 50},
-        roles = {"engineer", "president"},
-        generate = {gold = 5},
-        bonus = {trade = true},
-        interval = 60,
-        size = {x = 5, y = 4, z = 5},
-        node = "default:goldblock",
-        texture = "default_gold_block.png",
-        limit = 2
-    },
-    {
-        id = "military_base",
-        name = "Military Base",
-        description = "Enables missile construction and trains soldiers",
-        cost = {gold = 300, iron = 200, food = 100},
-        roles = {"engineer", "president"},
-        bonus = {military = true},
-        size = {x = 7, y = 5, z = 7},
-        node = "default:steelblock",
-        texture = "default_steel_block.png",
-        limit = 1
-    },
-    {
-        id = "missile_silo",
-        name = "Missile Silo",
-        description = "Allows construction and launch of missiles",
-        cost = {gold = 500, iron = 300, food = 50},
-        roles = {"engineer", "president"},
-        requires = "military_base",
-        bonus = {missiles = true},
-        size = {x = 5, y = 7, z = 5},
-        node = "default:obsidian",
-        texture = "default_obsidian.png",
-        limit = 1
-    },
-    {
-        id = "port",
-        name = "Port",
-        description = "Enables naval trade and faster resource generation",
-        cost = {gold = 400, iron = 200, food = 150},
-        roles = {"engineer", "president"},
-        bonus = {trade = true, generation = 1.5},
-        size = {x = 9, y = 3, z = 9},
-        node = "default:wood",
-        texture = "default_wood.png",
-        requires_water = true,
-        limit = 1
+local repair_sounds = {}
+if minetest.get_modpath("default") then
+    repair_sounds = default.node_sound_metal_defaults()
+else
+    repair_sounds = {
+        footstep = {name = "geopolitical_metal_footstep", gain = 0.5},
+        dig = {name = "geopolitical_metal_dig", gain = 0.5},
+        dug = {name = "geopolitical_metal_dug", gain = 1.0},
+        place = {name = "geopolitical_metal_place", gain = 1.0}
     }
-}
-
--- Building System State
-geopolitical.buildings = {}
-
--- Add this to country initialization
-for _, country in pairs(geopolitical.countries) do
-    country.buildings = {}
 end
 
--- Building Placement Function
-local function place_building(player, building_def, pos)
-    local player_name = player:get_player_name()
-    local player_data = geopolitical.players[player_name]
-    if not player_data then return false, "Player data not found" end
+-- Register the repair kit node
+minetest.register_node("geopolitical:repair_kit", {
+    description = S("Building Repair Kit") .. "\n" .. S("Place in damaged building to repair"),
+    tiles = {"geopolitical_repair_kit.png"},
+    inventory_image = "geopolitical_repair_kit.png",
+    groups = {cracky = 1, level = 2, repair_kit = 1},
+    sounds = repair_sounds,
     
-    local country = geopolitical.countries[player_data.country]
-    if not country then return false, "Country not found" end
-    
-    -- Check role permission
-    local has_role = false
-    for _, role in ipairs(building_def.roles) do
-        if player_data.role == role then
-            has_role = true
-            break
+    on_place = function(itemstack, placer, pointed_thing)
+        -- Basic placement checks
+        if pointed_thing.type ~= "node" then return end
+        if not placer or not placer:is_player() then return end
+        
+        local pos = pointed_thing.under
+        local player_name = placer:get_player_name()
+        local player_data = geopolitical.players[player_name]
+        
+        -- Player validation
+        if not player_data then
+            minetest.chat_send_player(player_name, S("Error: Player data not found!"))
+            return
         end
-    end
-    if not has_role then return false, "Your role cannot build this" end
-    
-    -- Check building limits
-    local current_of_type = 0
-    for _, b in ipairs(country.buildings) do
-        if b.type == building_def.id then
-            current_of_type = current_of_type + 1
+        
+        -- Find building at this position
+        local building, building_def
+        for hash, b in pairs(geopolitical.building_health or {}) do
+            local bpos = minetest.get_position_from_hash(hash)
+            
+            -- Find building definition
+            local bdef
+            for _, def in ipairs(geopolitical.BUILDINGS or {}) do
+                if def.id == b.type then
+                    bdef = def
+                    break
+                end
+            end
+            if not bdef then goto continue end
+            
+            -- Calculate building bounds
+            local half_x = math.floor(bdef.size.x / 2)
+            local half_z = math.floor(bdef.size.z / 2)
+            
+            -- Check if position is within building bounds
+            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
+               pos.y >= bpos.y and pos.y <= bpos.y + bdef.size.y-1 and
+               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
+                building = b
+                building_def = bdef
+                break
+            end
+            ::continue::
         end
+        
+        -- Building validation
+        if not building or not building_def then
+            minetest.chat_send_player(player_name, S("No building found at this location!"))
+            return
+        end
+        
+        -- Country permission check
+        if building.country ~= player_data.country then
+            minetest.chat_send_player(player_name, S("You can only repair your own country's buildings!"))
+            return
+        end
+        
+        -- Health check
+        local health_percent = (building.current_health / building.max_health) * 100
+        if health_percent >= 100 then
+            minetest.chat_send_player(player_name, S("This building doesn't need repair!"))
+            return
+        end
+        
+        -- Get country resources
+        local country = geopolitical.countries[player_data.country]
+        if not country or not country.resources then
+            minetest.chat_send_player(player_name, S("Error: Country data not found!"))
+            return
+        end
+        
+        -- Calculate and check repair cost
+        local repair_cost = math.max(1, math.floor((100 - health_percent) / 10)) -- At least 1 iron
+        if (country.resources.iron or 0) < repair_cost then
+            minetest.chat_send_player(player_name, 
+                S("Need @1 iron to repair this building (have @2)", repair_cost, country.resources.iron or 0))
+            return
+        end
+        
+        -- Perform repair
+        local nodes_repaired = 0
+        for _, node_pos in ipairs(building.nodes or {}) do
+            local node = minetest.get_node(node_pos)
+            if node.name ~= building_def.node then
+                minetest.set_node(node_pos, {name = building_def.node})
+                nodes_repaired = nodes_repaired + 1
+            end
+        end
+        
+        -- Update building and country data
+        country.resources.iron = (country.resources.iron or 0) - repair_cost
+        building.current_health = building.max_health
+        
+        -- Feedback
+        minetest.chat_send_player(player_name, 
+            S("Building repaired! Repaired @1 blocks for @2 iron. Now at 100% integrity.", 
+            nodes_repaired, repair_cost))
+        
+        -- Consume one repair kit
+        itemstack:take_item()
+        return itemstack
     end
-    if building_def.limit and current_of_type >= building_def.limit then
-        return false, "Building limit reached ("..building_def.limit..")"
+})
+
+-- Craft recipe for repair kit (with fallbacks)
+local steel_ingot = minetest.registered_items["default:steel_ingot"] and "default:steel_ingot" or "geopolitical:steel_ingot"
+local gold_ingot = minetest.registered_items["default:gold_ingot"] and "default:gold_ingot" or "geopolitical:gold_ingot"
+
+minetest.register_craft({
+    output = "geopolitical:repair_kit",
+    recipe = {
+        {steel_ingot, steel_ingot, steel_ingot},
+        {steel_ingot, gold_ingot, steel_ingot},
+        {steel_ingot, steel_ingot, steel_ingot}
+    }
+})
+
+-- Register fallback items if needed
+if not minetest.registered_items["default:steel_ingot"] then
+    minetest.register_craftitem("geopolitical:steel_ingot", {
+        description = S("Steel Ingot"),
+        inventory_image = "geopolitical_steel_ingot.png",
+    })
+end
+
+if not minetest.registered_items["default:gold_ingot"] then
+    minetest.register_craftitem("geopolitical:gold_ingot", {
+        description = S("Gold Ingot"),
+        inventory_image = "geopolitical_gold_ingot.png",
+    })
+end
+
+-- Building info command
+minetest.register_chatcommand("building_info", {
+    params = "",
+    description = S("Check the integrity of a building you're standing in"),
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, S("Player not found") end
+        
+        local pos = vector.round(player:get_pos())
+        
+        -- Find building
+        local building, building_def
+        for hash, b in pairs(geopolitical.building_health or {}) do
+            local bpos = minetest.get_position_from_hash(hash)
+            
+            -- Find building definition
+            local bdef
+            for _, def in ipairs(geopolitical.BUILDINGS or {}) do
+                if def.id == b.type then
+                    bdef = def
+                    break
+                end
+            end
+            if not bdef then goto continue end
+            
+            -- Calculate bounds
+            local half_x = math.floor(bdef.size.x / 2)
+            local half_z = math.floor(bdef.size.z / 2)
+            
+            -- Check position
+            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
+               pos.y >= bpos.y and pos.y <= bpos.y + bdef.size.y-1 and
+               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
+                building = b
+                building_def = bdef
+                break
+            end
+            ::continue::
+        end
+        
+        if not building or not building_def then
+            return false, S("You're not inside any building")
+        end
+        
+        -- Calculate health and status
+        local health_percent = (building.current_health / building.max_health) * 100
+        local status_msg, status_color
+        
+        if health_percent >= 90 then
+            status_msg = S("Excellent condition")
+            status_color = "#00FF00" -- Green
+        elseif health_percent >= 70 then
+            status_msg = S("Good condition")
+            status_color = "#00FFFF" -- Cyan
+        elseif health_percent >= 50 then
+            status_msg = S("Damaged")
+            status_color = "#FFFF00" -- Yellow
+        elseif health_percent >= 30 then
+            status_msg = S("Heavily damaged")
+            status_color = "#FFA500" -- Orange
+        elseif health_percent >= 20 then
+            status_msg = S("Critical condition")
+            status_color = "#FF0000" -- Red
+        else
+            status_msg = S("Non-functional")
+            status_color = "#800000" -- Dark Red
+        end
+        
+        return true, string.format(
+            "%s: %.1f%%\n%s: <color=%s>%s</color>\n%s: %d %s",
+            S("Integrity"), health_percent,
+            S("Status"), status_color, status_msg,
+            S("Repair cost"), math.floor((100 - health_percent) / 10), S("iron")
+        )
     end
+})
+minetest.register_node("geopolitical:repair_kit", {
+    description = "Building Repair Kit\nPlace in damaged building to repair",
+    tiles = {"default_tool_steelpick.png"},
+    groups = {cracky = 1, level = 2},
+    sounds = default.node_sound_metal_defaults(),
     
-    -- Check requirements
-    if building_def.requires then
-        local has_requirement = false
-        for _, b in ipairs(country.buildings) do
-            if b.type == building_def.requires then
-                has_requirement = true
+    on_place = function(itemstack, placer, pointed_thing)
+        if pointed_thing.type ~= "node" then return end
+        
+        local pos = pointed_thing.under
+        local player_name = placer:get_player_name()
+        local player_data = geopolitical.players[player_name]
+        
+        if not player_data then return end
+        
+        -- Find building at this position
+        local building
+        for hash, b in pairs(geopolitical.building_health) do
+            local bpos = minetest.get_position_from_hash(hash)
+            local half_x = math.floor(geopolitical.BUILDINGS[b.type].size.x / 2)
+            local half_z = math.floor(geopolitical.BUILDINGS[b.type].size.z / 2)
+            
+            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
+               pos.y >= bpos.y and pos.y <= bpos.y + geopolitical.BUILDINGS[b.type].size.y-1 and
+               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
+                building = b
                 break
             end
         end
-        if not has_requirement then
-            return false, "Requires "..building_def.requires.." to be built first"
-        end
-    end
-    
-    -- Check water requirement for ports
-    if building_def.requires_water then
-        local water_nearby = false
-        for x = -1, 1 do
-            for z = -1, 1 do
-                local check_pos = vector.add(pos, {x=x, y=-1, z=z})
-                local node = minetest.get_node(check_pos)
-                if node.name == "default:water_source" or node.name == "default:river_water_source" then
-                    water_nearby = true
-                    break
-                end
-            end
-            if water_nearby then break end
-        end
-        if not water_nearby then
-            return false, "Must be built next to water"
-        end
-    end
-    
-    -- Check resources
-    for res, amount in pairs(building_def.cost) do
-        if country.resources[res] < amount then
-            return false, "Not enough "..res.." (need "..amount..", have "..country.resources[res]..")"
-        end
-    end
-    
-    -- Deduct resources
-    for res, amount in pairs(building_def.cost) do
-        country.resources[res] = country.resources[res] - amount
-    end
-    
-    -- Create building
-    local building = {
-        type = building_def.id,
-        pos = pos,
-        country = country.name,
-        owner = player_name,
-        generated_at = os.time()
-    }
-    
-    table.insert(country.buildings, building)
-    table.insert(geopolitical.buildings, building)
-    
-    -- Create visual structure
-    local half_x = math.floor(building_def.size.x / 2)
-    local half_z = math.floor(building_def.size.z / 2)
-    
-    for x = -half_x, half_x do
-        for y = 0, building_def.size.y-1 do
-            for z = -half_z, half_z do
-                local place_pos = vector.add(pos, {x=x, y=y, z=z})
-                if y == 0 then
-                    -- Foundation
-                    minetest.set_node(place_pos, {name=building_def.node})
-                elseif y == building_def.size.y-1 then
-                    -- Roof
-                    minetest.set_node(place_pos, {name=building_def.node})
-                else
-                    -- Walls
-                    if x == -half_x or x == half_x or z == -half_z or z == half_z then
-                        minetest.set_node(place_pos, {name=building_def.node})
-                    end
-                end
-            end
-        end
-    end
-    
-    -- Add entrance
-    minetest.set_node(pos, {name="air"})
-    minetest.set_node(vector.add(pos, {x=0, y=1, z=0}), {name="air"})
-    
-    -- Apply country color
-    if minetest.get_modpath("unifieddyes") then
-        for x = -half_x, half_x do
-            for z = -half_z, half_z do
-                local place_pos = vector.add(pos, {x=x, y=1, z=z})
-                if minetest.get_node(place_pos).name == building_def.node then
-                    minetest.set_node(place_pos, {name="unifieddyes:"..country.color.."_wall"})
-                end
-            end
-        end
-    end
-    
-    -- Apply bonuses
-    if building_def.bonus then
-        for bonus, value in pairs(building_def.bonus) do
-            if bonus == "trade" then
-                country.can_trade = true
-            elseif bonus == "military" then
-                country.can_train_military = true
-            elseif bonus == "missiles" then
-                country.can_build_missiles = true
-            end
-        end
-    end
-    
-    return true, building_def.name.." built successfully!"
-end
-
--- Building Resource Generation
-local function generate_building_resources()
-    local now = os.time()
-    
-    for _, building in ipairs(geopolitical.buildings) do
-        local country = geopolitical.countries[building.country]
-        if country then
-            local building_def
-            for _, def in ipairs(geopolitical.BUILDINGS) do
-                if def.id == building.type then
-                    building_def = def
-                    break
-                end
-            end
-            
-            if building_def and building_def.generate and (now - building.generated_at) >= building_def.interval then
-                local multiplier = 1
-                -- Check for port bonus
-                for _, b in ipairs(country.buildings) do
-                    if b.type == "port" then
-                        multiplier = 1.5
-                        break
-                    end
-                end
-                
-                for res, amount in pairs(building_def.generate) do
-                    country.resources[res] = country.resources[res] + (amount * multiplier)
-                end
-                building.generated_at = now
-            end
-        end
-    end
-    
-    minetest.after(10, generate_building_resources)
-end
-
-minetest.after(10, generate_building_resources)
-
--- Building Placement Command
-minetest.register_chatcommand("build", {
-    params = "<building_type>",
-    description = "Build a structure (engineers and president only)",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return false, "Player not found" end
         
+        if not building then
+            minetest.chat_send_player(player_name, "No building found at this location!")
+            return
+        end
+        
+        -- Check if player is from the same country
+        if building.country ~= player_data.country then
+            minetest.chat_send_player(player_name, "You can only repair your own country's buildings!")
+            return
+        end
+        
+        -- Check if building needs repair
+        local health_percent = (building.current_health / building.max_health) * 100
+        if health_percent >= 100 then
+            minetest.chat_send_player(player_name, "This building doesn't need repair!")
+            return
+        end
+        
+        -- Get building definition
         local building_def
         for _, def in ipairs(geopolitical.BUILDINGS) do
-            if def.id == param then
+            if def.id == building.type then
                 building_def = def
                 break
             end
         end
         
-        if not building_def then
-            local building_list = ""
-            for _, def in ipairs(geopolitical.BUILDINGS) do
-                building_list = building_list .. def.id .. ", "
-            end
-            return false, "Invalid building type. Available: "..building_list:sub(1, -3)
+        if not building_def then return end
+        
+        -- Repair the building
+        local repair_cost = math.floor((100 - health_percent) / 10) -- 1 iron per 10% missing
+        local country = geopolitical.countries[player_data.country]
+        
+        if country.resources.iron < repair_cost then
+            minetest.chat_send_player(player_name, 
+                "Need "..repair_cost.." iron to repair this building (have "..country.resources.iron..")")
+            return
         end
+        
+        -- Deduct resources
+        country.resources.iron = country.resources.iron - repair_cost
+        
+        -- Restore all building blocks
+        for _, node_pos in ipairs(building.nodes) do
+            local node = minetest.get_node(node_pos)
+            local expected_node = building_def.node
+            
+            -- Special cases for certain buildings
+            if building.type == "port" then
+                expected_node = "default:wood"
+            elseif building.type == "missile_silo" then
+                expected_node = "default:obsidian"
+            elseif building.type == "military_base" then
+                expected_node = "default:steelblock"
+            elseif building.type == "trade_center" then
+                expected_node = "default:goldblock"
+            end
+            
+            if node.name ~= expected_node then
+                minetest.set_node(node_pos, {name=expected_node})
+            end
+        end
+        
+        -- Update building health
+        building.current_health = building.max_health
+        
+        minetest.chat_send_player(player_name, 
+            "Building repaired for "..repair_cost.." iron! Now at 100% integrity.")
+        
+        -- Consume one repair kit
+        itemstack:take_item()
+        return itemstack
+    end
+})
+
+-- Craft recipe for repair kit
+minetest.register_craft({
+    output = "geopolitical:repair_kit",
+    recipe = {
+        {"default:steel_ingot", "default:steel_ingot", "default:steel_ingot"},
+        {"default:steel_ingot", "default:gold_ingot", "default:steel_ingot"},
+        {"default:steel_ingot", "default:steel_ingot", "default:steel_ingot"}
+    }
+})
+
+-- Add building integrity info to /buildings command
+minetest.register_chatcommand("building_info", {
+    params = "",
+    description = "Check the integrity of a building you're standing in",
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "Player not found" end
         
         local pos = player:get_pos()
         pos.x = math.floor(pos.x + 0.5)
         pos.y = math.floor(pos.y + 0.5)
         pos.z = math.floor(pos.z + 0.5)
         
-        -- Adjust position to center of building
-        pos.x = pos.x + math.floor(building_def.size.x / 2)
-        pos.z = pos.z + math.floor(building_def.size.z / 2)
+        -- Find building at this position
+        local building
+        for hash, b in pairs(geopolitical.building_health) do
+            local bpos = minetest.get_position_from_hash(hash)
+            local half_x = math.floor(geopolitical.BUILDINGS[b.type].size.x / 2)
+            local half_z = math.floor(geopolitical.BUILDINGS[b.type].size.z / 2)
+            
+            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
+               pos.y >= bpos.y and pos.y <= bpos.y + geopolitical.BUILDINGS[b.type].size.y-1 and
+               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
+                building = b
+                break
+            end
+        end
         
-        local success, msg = place_building(player, building_def, pos)
-        if success then
-            minetest.chat_send_player(name, msg)
-            minetest.chat_send_all(name.." has built a "..building_def.name.." for "..geopolitical.players[name].country)
+        if not building then
+            return false, "You're not inside any building"
+        end
+        
+        local building_def
+        for _, def in ipairs(geopolitical.BUILDINGS) do
+            if def.id == building.type then
+                building_def = def
+                break
+            end
+        end
+        
+        if not building_def then return false, "Building type not found" end
+        
+        local health_percent = (building.current_health / building.max_health) * 100
+        local status_msg
+        
+        if health_percent >= 90 then
+            status_msg = "§aExcellent condition"
+        elseif health_percent >= 70 then
+            status_msg = "§bGood condition"
+        elseif health_percent >= 50 then
+            status_msg = "§eDamaged"
+        elseif health_percent >= 30 then
+            status_msg = "§6Heavily damaged"
+        elseif health_percent >= 20 then
+            status_msg = "§cCritical condition"
         else
-            return false, msg
-        end
-    end
-})
-
--- Missile System (requires military base and silo)
-minetest.register_chatcommand("build_missile", {
-    description = "Build a missile (requires military base and silo)",
-    func = function(name, param)
-        local player_data = geopolitical.players[name]
-        if not player_data then return false, "Player data not found" end
-        
-        local country = geopolitical.countries[player_data.country]
-        if not country then return false, "Country not found" end
-        
-        if not country.can_build_missiles then
-            return false, "You need a military base and missile silo to build missiles"
+            status_msg = "§4Non-functional"
         end
         
-        if country.resources.iron < 100 or country.resources.gold < 50 then
-            return false, "Need 100 iron and 50 gold to build a missile"
-        end
-        
-        country.resources.iron = country.resources.iron - 100
-        country.resources.gold = country.resources.gold - 50
-        country.missiles = (country.missiles or 0) + 1
-        
-        return true, "Missile constructed! Total: "..country.missiles
-    end
-})
-
--- Missile Launch Command
-minetest.register_chatcommand("launch_missile", {
-    params = "<target_country>",
-    description = "Launch a missile at another country (president only)",
-    func = function(name, param)
-        local player_data = geopolitical.players[name]
-        if not player_data then return false, "Player data not found" end
-        
-        if player_data.role ~= "president" then
-            return false, "Only the president can launch missiles"
-        end
-        
-        local country = geopolitical.countries[player_data.country]
-        if not country then return false, "Country not found" end
-        
-        if not country.can_build_missiles then
-            return false, "You need a military base and missile silo to launch missiles"
-        end
-        
-        if (country.missiles or 0) < 1 then
-            return false, "No missiles available"
-        end
-        
-        local target_country = geopolitical.countries[param]
-        if not target_country then
-            return false, "Target country not found"
-        end
-        
-        country.missiles = country.missiles - 1
-        
-        -- Damage random building in target country
-        if #target_country.buildings > 0 then
-            local random_index = math.random(1, #target_country.buildings)
-            local destroyed_building = table.remove(target_country.buildings, random_index)
-            
-            -- Remove building visually
-            local building_def
-            for _, def in ipairs(geopolitical.BUILDINGS) do
-                if def.id == destroyed_building.type then
-                    building_def = def
-                    break
-                end
-            end
-            
-            if building_def then
-                local half_x = math.floor(building_def.size.x / 2)
-                local half_z = math.floor(building_def.size.z / 2)
-                
-                for x = -half_x, half_x do
-                    for y = 0, building_def.size.y-1 do
-                        for z = -half_z, half_z do
-                            local place_pos = vector.add(destroyed_building.pos, {x=x, y=y, z=z})
-                            minetest.set_node(place_pos, {name="tnt:tnt"})
-                        end
-                    end
-                end
-                
-                minetest.after(1, function(pos)
-                    tnt.boom(pos, {damage_radius=5, radius=3})
-                end, destroyed_building.pos)
-            end
-            
-            minetest.chat_send_all("☢️ "..country.name.." launched a missile at "..target_country.name..
-                "! Their "..(building_def and building_def.name or "building").." was destroyed!")
-        else
-            minetest.chat_send_all("☢️ "..country.name.." launched a missile at "..target_country.name..
-                " but they have no buildings to damage!")
-        end
-        
-        return true, "Missile launched at "..target_country.name
-    end
-})
-
--- Building Info Command
-minetest.register_chatcommand("buildings", {
-    description = "List your country's buildings",
-    func = function(name, param)
-        local player_data = geopolitical.players[name]
-        if not player_data then return false, "Player data not found" end
-        
-        local country = geopolitical.countries[player_data.country]
-        if not country then return false, "Country not found" end
-        
-        if #country.buildings == 0 then
-            return true, "Your country has no buildings yet. Use /build to create some!"
-        end
-        
-        local building_counts = {}
-        for _, building in ipairs(country.buildings) do
-            building_counts[building.type] = (building_counts[building.type] or 0) + 1
-        end
-        
-        local msg = "Your country's buildings:\n"
-        for building_type, count in pairs(building_counts) do
-            for _, def in ipairs(geopolitical.BUILDINGS) do
-                if def.id == building_type then
-                    msg = msg .. string.format("- %s: %d/%d\n", def.name, count, def.limit or 99)
-                    break
-                end
-            end
-        end
-        
-        -- Show missile count if applicable
-        if country.can_build_missiles then
-            msg = msg .. "\nMissiles: "..(country.missiles or 0)
-        end
-        
-        return true, msg
+        return true, string.format("%s Integrity: %.1f%%\n%s\nRepair cost: %d iron",
+            building_def.name, health_percent, status_msg,
+            math.floor((100 - health_percent) / 10))
     end
 })
