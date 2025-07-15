@@ -288,18 +288,21 @@ local function count_country_players(country)
     end
     return count
 end
-
--- Assign identity name
+-- Modern identity names
 local first_names = {
-    "Alex", "Morgan", "Taylor", "Jordan", "Casey", "Riley", "Quinn", "Parker", "Reese", "Jamie"
+    "Aiden", "Nova", "Zane", "Luna", "Kai", "Aria", "Milo", "Jade", "Ezra", "Skye",
+    "Lex", "Rhea", "Blaze", "Kira", "Orion", "Sloane", "Ace", "Nico", "Jett", "Zara"
 }
 local last_names = {
-    "Stone", "Blaze", "Hawk", "Storm", "Knight", "Fox", "Wolf", "Viper", "Steel", "Shadow"
+    "Vance", "Drayke", "Cross", "Nyx", "Kane", "Ashford", "Reign", "Blake", "Nova", "Striker",
+    "Storme", "Locke", "Vector", "Crimson", "Ryder", "Quinn", "Shade", "Valor", "Cipher", "Flux"
 }
+
 local function generate_identity()
     return first_names[math.random(#first_names)] .. " " .. last_names[math.random(#last_names)]
 end
 
+-- Starter gear
 local function give_starter_gear(player)
     local inv = player:get_inventory()
     inv:add_item("main", "default:pick_iron")
@@ -307,19 +310,122 @@ local function give_starter_gear(player)
     inv:add_item("main", "default:sword_iron")
 end
 
+-- Dash system variables
+local dash_cooldowns = {}
+local DASH_COOLDOWN = 5       -- seconds cooldown between dashes
+local DASH_SPEED_MULTIPLIER = 3 -- dash speed multiplier
+local DASH_DURATION = 0.5     -- dash duration in seconds
+local LIFT_VELOCITY = 8       -- upward lift velocity
+local FORWARD_VELOCITY = 15   -- forward push velocity
+
+-- Propulsion function: lifts player up then pushes forward
+local function propel_player(player)
+    if not player or not player:is_player_connected() then return end
+
+    local dir = player:get_look_dir()
+    local lift_velocity = {x=0, y=LIFT_VELOCITY, z=0}
+    local forward_velocity = {x=dir.x * FORWARD_VELOCITY, y=0, z=dir.z * FORWARD_VELOCITY}
+
+    player:add_velocity(lift_velocity)
+
+    minetest.after(0.3, function()
+        if player and player:is_player_connected() then
+            player:add_velocity(forward_velocity)
+            minetest.chat_send_player(player:get_player_name(), "[Propulsion] Boosted forward!")
+        end
+    end)
+end
+
+-- Check if player can dash (cooldown elapsed)
+local function can_dash(player)
+    local name = player:get_player_name()
+    local now = minetest.get_us_time() / 1000000 -- current time in seconds
+    dash_cooldowns[name] = dash_cooldowns[name] or 0
+    return now > dash_cooldowns[name]
+end
+
+-- Perform dash action: speed boost + propulsion + cooldown
+local function do_dash(player)
+    local name = player:get_player_name()
+    local now = minetest.get_us_time() / 1000000
+
+    -- Set cooldown
+    dash_cooldowns[name] = now + DASH_COOLDOWN
+
+    -- Boost speed
+    player:set_physics_override({speed = DASH_SPEED_MULTIPLIER})
+
+    -- Propel player
+    propel_player(player)
+
+    minetest.chat_send_player(name, "[Dash] Activated!")
+
+    -- Reset speed after DASH_DURATION seconds
+    minetest.after(DASH_DURATION, function()
+        if player and player:is_player_connected() then
+            player:set_physics_override({speed = 1.0})
+            minetest.chat_send_player(name, "[Dash] Ended.")
+        end
+    end)
+end
+
+-- Globalstep to detect dash input (sneak + jump)
+minetest.register_globalstep(function(dtime)
+    for _, player in pairs(minetest.get_connected_players()) do
+        local ctrl = player:get_player_control()
+        if ctrl.sneak and ctrl.jump and can_dash(player) then
+            do_dash(player)
+        end
+    end
+end)
+
+-- Base abilities (modern style)
+local ability_pool = {
+    {name = "Tactical Sprint",      effect = function(p) p:set_physics_override({speed=1.3}) end},
+    {name = "Enhanced Legs",        effect = function(p) p:set_physics_override({jump=1.2}) end},
+    {name = "Combat HUD",           effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] Enemies are more visible!") end},
+    {name = "Smart Regen",          effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] You heal slightly faster over time.") end},
+    {name = "Kinetic Padding",      effect = function(p) p:set_armor_groups({fleshy=85}) end},
+    {name = "Urban Climber",        effect = function(p) p:set_physics_override({jump=1.1, gravity=0.95}) end},
+    {name = "Thermal Optics",       effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] You can detect body heat (roleplay)") end},
+    {name = "Silent Boots",         effect = function(p) p:set_physics_override({speed=1.1, sneak=true}) end},
+    {name = "Adaptive Grip",        effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] Climbing/sliding is easier") end},
+    {name = "Stimulant Injector",   effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] Temporary adrenaline boosts on damage") end},
+    {name = "Adrenal Core",         effect = function(p) minetest.chat_send_player(p:get_player_name(), "[Abilities] Sudden burst of movement after being hit") end},
+}
+
+-- Rare high-tech powers
+local rare_abilities = {
+    {name = "Exo Dash Module",      effect = function(p) minetest.chat_send_player(p:get_player_name(), "[RARE] Dash enabled: sneak + jump to dash with propulsion.") end},
+    {name = "EMP Shielding",        effect = function(p) minetest.chat_send_player(p:get_player_name(), "[RARE] Immune to disruption effects (roleplay)") end},
+    {name = "Cyber Reflexes",       effect = function(p) p:set_physics_override({speed=1.5, jump=1.2}) end},
+    {name = "Neural Uplink",        effect = function(p) minetest.chat_send_player(p:get_player_name(), "[RARE] AI-assisted movement prediction (roleplay)") end},
+    {name = "Nano Repair Core",     effect = function(p) minetest.chat_send_player(p:get_player_name(), "[RARE] You slowly regenerate even during combat") end},
+}
+
 local function apply_abilities(player, rank)
-    if rank == "Engineer" then
-        player:set_physics_override({speed=1.2, jump=1.0})
-        minetest.chat_send_player(player:get_player_name(), "[Abilities] Engineer: +20% speed")
-    elseif rank == "Soldier" then
-        player:set_physics_override({speed=1.0, jump=1.1})
-        minetest.chat_send_player(player:get_player_name(), "[Abilities] Soldier: +10% jump")
-    elseif rank == "President" then
-        player:set_armor_groups({fleshy=75})
-        minetest.chat_send_player(player:get_player_name(), "[Abilities] President: Damage resistance")
-    else
-        player:set_physics_override({speed=1.0, jump=1.0})
-        player:set_armor_groups({fleshy=100})
+    player:set_physics_override({speed=1.0, jump=1.0, gravity=1.0})
+    player:set_armor_groups({fleshy = 100})
+    player:set_properties({hp_max = 20})
+    player:set_hp(20)
+
+    local chosen = {}
+    for i = 1, 2 do
+        local index = math.random(#ability_pool)
+        local ability = ability_pool[index]
+        table.insert(chosen, ability.name)
+        ability.effect(player)
+    end
+
+    if math.random(5) == 1 then
+        local rare = rare_abilities[math.random(#rare_abilities)]
+        table.insert(chosen, rare.name)
+        rare.effect(player)
+    end
+
+    minetest.chat_send_player(player:get_player_name(), "[Abilities] Rank: " .. rank)
+    for _, name in ipairs(chosen) do
+        minetest.chat_send_player(player:get_player_name(), " - " .. name)
     end
 end
 
