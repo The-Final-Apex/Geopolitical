@@ -1,1157 +1,675 @@
--- Geopolitical System for Minetest
--- Features:
--- - Players spawn into preset countries
--- - First player in country becomes president
--- - Subsequent players become soldiers or engineers
--- - Random perks assigned on spawn/respawn
--- - Country interactions (peace, trade, non-aggression, etc.)
--- - Organizations that transcend countries
--- Default mod fallbacks
-function table.contains(tbl, val)
-    for _, v in ipairs(tbl) do
-        if v == val then
+
+-- Geopolitical Mod - Fully Refactored with Persistence
+-- Note: No guns included. Handles countries, diplomacy, identities, and tech progression.
+
+-- === Config ===
+local countries = {"Zarnovia", "Belgrast", "Karelia", "Velturn", "Rhodesia", "Tarkhan", "New Andoria", "Myvak"}
+local ranks = {"President", "Soldier", "Engineer", "Citizen"}
+
+local country_spawns = {
+    Zarnovia = {x=100, y=10, z=100},
+    Belgrast = {x=200, y=10, z=100},
+    Karelia = {x=300, y=10, z=100},
+    Velturn = {x=400, y=10, z=100},
+    Rhodesia = {x=500, y=10, z=100},
+    Tarkhan = {x=600, y=10, z=100},
+    ["New Andoria"] = {x=700, y=10, z=100},
+    Myvak = {x=800, y=10, z=100},
+}
+
+-- === Storage & Persistence ===
+local base_path = minetest.get_worldpath() .. "/geopolitical_"
+local files = {
+    diplomacy = base_path .. "diplomacy.txt",
+    requests = base_path .. "requests.txt",
+    pdata = base_path .. "player_data.txt",
+    identities = base_path .. "identities.txt",
+    tech = base_path .. "tech_levels.txt",
+}
+
+local function save_table(path, table_data)
+    local file = io.open(path, "w")
+    if file then file:write(minetest.serialize(table_data)) file:close() end
+end
+
+local function load_table(path)
+    local file = io.open(path, "r")
+    if file then local data = file:read("*a") file:close() return minetest.deserialize(data) or {} end
+    return {}
+end
+
+-- Load on startup
+diplomacy = load_table(files.diplomacy)
+pending_requests = load_table(files.requests)
+player_data = load_table(files.pdata)
+player_identities = load_table(files.identities)
+country_tech_levels = load_table(files.tech)
+tech_trees = {}
+
+-- Example tech tree definition (you can customize this per country)
+for _, country in ipairs(countries) do
+    tech_trees[country] = {
+        unlocked = { "basic_mining" },
+        techs = {
+            basic_mining = { desc = "Basic mining techniques", unlock_cost = 0 },
+            advanced_weapons = { desc = "Advanced weaponry (disabled)", unlock_cost = 5 },
+            trade_routes = { desc = "Enables trade infrastructure", unlock_cost = 3 },
+            diplomacy_expert = { desc = "Unlocks advanced diplomacy", unlock_cost = 4 },
+        }
+    }
+end
+
+-- Init if empty
+for _, c in ipairs(countries) do
+    diplomacy[c] = diplomacy[c] or {}
+    for _, c2 in ipairs(countries) do
+        if c ~= c2 and not diplomacy[c][c2] then
+            diplomacy[c][c2] = "peace"
+        end
+    end
+    country_tech_levels[c] = country_tech_levels[c] or 1
+end
+
+-- Auto save
+local save_timer = 0
+minetest.register_globalstep(function(dtime)
+    save_timer = save_timer + dtime
+    if save_timer > 300 then
+        save_table(files.diplomacy, diplomacy)
+        save_table(files.requests, pending_requests)
+        save_table(files.pdata, player_data)
+        save_table(files.identities, player_identities)
+        save_table(files.tech, country_tech_levels)
+        save_timer = 0
+    end
+end)
+
+-- Save on shutdown
+minetest.register_on_shutdown(function()
+    save_table(files.diplomacy, diplomacy)
+    save_table(files.requests, pending_requests)
+    save_table(files.pdata, player_data)
+    save_table(files.identities, player_identities)
+    save_table(files.tech, country_tech_levels)
+end)
+
+
+
+-- Tech tree example (you expand)
+for _, c in ipairs(countries) do
+    tech_trees[c] = {
+        unlocked = { "basic_mining" },  -- start with basic tech
+        techs = {
+            basic_mining = {desc="Basic mining techniques", unlock_cost=0},
+            advanced_weapons = {desc="Advanced weapon tech", unlock_cost=5},
+            trade_routes = {desc="Trade routes", unlock_cost=3},
+            diplomacy_expert = {desc="Improved diplomacy", unlock_cost=4},
+        }
+    }
+end
+function relations_formspec(player_name, selected_country)
+    local pdata = player_data[player_name]
+    local my_country = pdata and pdata.country or "None"
+
+    local formspec = "size[8,10]"
+    formspec = formspec .. "label[0,0;Relations Overview]"
+    formspec = formspec .. "dropdown[0,0.5;6,0.8;country;"..table.concat(countries, ",")..";" .. (table.indexof(countries, selected_country) or 1) .. "]"
+    formspec = formspec .. "label[0,1.5;Inspecting country: "..selected_country.."]"
+
+    -- Your relation with selected
+    if my_country ~= "None" and my_country ~= selected_country then
+        local rel = diplomacy[my_country][selected_country] or "peace"
+        formspec = formspec .. "label[0,2.2;Your relation with "..selected_country..": "..rel.."]"
+    end
+
+    -- Other pacts of selected country
+    formspec = formspec .. "label[0,3.0;"..selected_country.."'s pacts:]"
+
+    local y = 3.5
+    for _, other in ipairs(countries) do
+        if other ~= selected_country then
+            local rel = diplomacy[selected_country][other]
+            if rel and rel ~= "peace" then
+                formspec = formspec .. string.format("label[0,%f;→ %s: %s]", y, other, rel)
+                y = y + 0.5
+            end
+        end
+    end
+
+    return formspec
+end
+
+-- Pending Requests helpers
+function add_request(to_country, from_country, type)
+    pending_requests[to_country] = pending_requests[to_country] or {}
+    table.insert(pending_requests[to_country], {from = from_country, type = type})
+end
+
+function accept_diplomacy_request(to, from, type, playername)
+    diplomacy[to][from] = type
+    diplomacy[from][to] = type
+    pending_requests[to] = pending_requests[to] or {}
+    for i, req in ipairs(pending_requests[to]) do
+        if req.from == from and req.type == type then
+            table.remove(pending_requests[to], i)
+            break
+        end
+    end
+    minetest.chat_send_all("[Diplomacy] "..to.." and "..from.." have agreed on "..type.."!")
+end
+
+function reject_diplomacy_request(to, from, type, playername)
+    pending_requests[to] = pending_requests[to] or {}
+    for i, req in ipairs(pending_requests[to]) do
+        if req.from == from and req.type == type then
+            table.remove(pending_requests[to], i)
+            break
+        end
+    end
+    minetest.chat_send_player(playername, "You rejected "..type.." request from "..from)
+end
+
+
+-- Count players in a country (online + offline)
+local function count_country_players(country)
+    local count = 0
+    for _, data in pairs(player_data) do
+        if data.country == country then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Assign identity name
+local first_names = {
+    "Alex", "Morgan", "Taylor", "Jordan", "Casey", "Riley", "Quinn", "Parker", "Reese", "Jamie"
+}
+local last_names = {
+    "Stone", "Blaze", "Hawk", "Storm", "Knight", "Fox", "Wolf", "Viper", "Steel", "Shadow"
+}
+local function generate_identity()
+    return first_names[math.random(#first_names)] .. " " .. last_names[math.random(#last_names)]
+end
+
+local function give_starter_gear(player)
+    local inv = player:get_inventory()
+    inv:add_item("main", "default:pick_iron")
+    inv:add_item("main", "default:axe_iron")
+    inv:add_item("main", "default:sword_iron")
+end
+
+local function apply_abilities(player, rank)
+    if rank == "Engineer" then
+        player:set_physics_override({speed=1.2, jump=1.0})
+        minetest.chat_send_player(player:get_player_name(), "[Abilities] Engineer: +20% speed")
+    elseif rank == "Soldier" then
+        player:set_physics_override({speed=1.0, jump=1.1})
+        minetest.chat_send_player(player:get_player_name(), "[Abilities] Soldier: +10% jump")
+    elseif rank == "President" then
+        player:set_armor_groups({fleshy=75})
+        minetest.chat_send_player(player:get_player_name(), "[Abilities] President: Damage resistance")
+    else
+        player:set_physics_override({speed=1.0, jump=1.0})
+        player:set_armor_groups({fleshy=100})
+    end
+end
+
+local function set_spawn(player, country)
+    local pos = country_spawns[country]
+    if pos then
+        player:set_pos(pos)
+    else
+        minetest.log("warning", "[geopolitical] No spawn pos for country: "..country)
+    end
+end
+
+minetest.register_on_joinplayer(function(player)
+    local name = player:get_player_name()
+
+    -- Initialize player data if missing
+    if not player_data[name] then
+        -- Assign random country, identity, and rank
+        local country = countries[math.random(#countries)]
+        local identity = generate_identity()
+        local count = count_country_players(country)
+        local rank = (count == 0) and "President" or "Citizen"
+        player_data[name] = {country=country, rank=rank, identity=identity}
+        save_table(files.pdata, player_data)
+        minetest.chat_send_player(name, "[Geopolitics] Welcome, " ..
+            minetest.colorize("#00ff00", identity) ..
+            ", you have been assigned to " ..
+            minetest.colorize("#00ffff", country) ..
+            " as a " .. minetest.colorize("#ffff00", rank) .. ".")
+    else
+        local info = player_data[name]
+        minetest.chat_send_player(name, "[Geopolitics] Welcome back, " ..
+            minetest.colorize("#00ff00", info.identity) ..
+            ", " .. minetest.colorize("#ffff00", info.rank) ..
+            " of " .. minetest.colorize("#00ffff", info.country) .. "!")
+    end
+
+    set_spawn(player, player_data[name].country)
+    give_starter_gear(player)
+    apply_abilities(player, player_data[name].rank)
+end)
+
+
+minetest.register_on_respawnplayer(function(player)
+    local name = player:get_player_name()
+    local data = player_data[name]
+    if data then
+        local identity = generate_identity()
+        local rank = "Citizen"
+        if count_country_players(data.country) == 1 then
+            rank = "President"
+        end
+        player_data[name].identity = identity
+        player_data[name].rank = rank
+        save_data(name)
+        minetest.after(0.5, function()
+            minetest.chat_send_player(name, "[Geopolitics] You respawned as " ..
+                minetest.colorize("#00ff00", identity) ..
+                ", a " .. minetest.colorize("#ffff00", rank) ..
+                " of " .. minetest.colorize("#00ffff", data.country) .. ".")
+        end)
+        set_spawn(player, data.country)
+        apply_abilities(player, rank)
+        give_starter_gear(player)
+    end
+end)
+
+-- Chat override
+minetest.register_on_chat_message(function(name, message)
+    local data = player_data[name]
+    if data then
+        local identity = data.identity or name
+        minetest.chat_send_all("[" .. data.country .. "] " .. identity .. ": " .. message)
+        return true
+    end
+    return false
+end)
+
+minetest.register_chatcommand("myinfo", {
+    description = "Check your country, rank and identity.",
+    func = function(name)
+        local info = player_data[name]
+        if info then
+            return true, string.format("You are %s (%s) of %s.", info.identity, info.rank, info.country)
+        else
+            return false, "No information found."
+        end
+    end
+})
+
+-- Diplomacy request logic
+local function can_manage_diplomacy(player_name)
+    local pdata = player_data[player_name]
+    return pdata and pdata.rank == "President"
+end
+
+local function send_diplomacy_request(from_country, to_country, req_type, player_name)
+    if not diplomacy[from_country] or not diplomacy[from_country][to_country] then
+        minetest.chat_send_player(player_name, "Invalid countries.")
+        return
+    end
+    -- War requests auto-accepted
+    if req_type == "war" then
+        diplomacy[from_country][to_country] = "war"
+        diplomacy[to_country][from_country] = "war"
+        minetest.chat_send_all("[Diplomacy] " .. from_country .. " declared war on " .. to_country .. "!")
+        return
+    end
+    -- For others, add request
+    add_request(to_country, from_country, req_type)
+    minetest.chat_send_player(player_name, "Request sent for " .. req_type .. " to " .. to_country .. ". Waiting for acceptance.")
+end
+
+local function accept_diplomacy_request(to_country, from_country, req_type, player_name)
+    local requests = pending_requests[to_country]
+    if not requests then return false end
+    for i, req in ipairs(requests) do
+        if req.from == from_country and req.type == req_type then
+            diplomacy[to_country][from_country] = req_type
+            diplomacy[from_country][to_country] = req_type
+            table.remove(requests, i)
+            minetest.chat_send_all("[Diplomacy] " .. to_country .. " accepted " .. req_type .. " with " .. from_country .. ".")
             return true
         end
     end
     return false
 end
 
-local default_mod = minetest.get_modpath("default")
-local default = {
-    node_sound_metal_defaults = function()
-        return {
-            footstep = {name = "default_metal_footstep", gain = 0.4},
-            dig = {name = "default_dig_metal", gain = 0.5},
-            dug = {name = "default_dug_metal", gain = 1.0}
-        }
-    end
-}
-
-if not default_mod then
-    default = {
-        node_sound_metal_defaults = function()
-            return {
-                footstep = {name = "geopolitical_metal_footstep", gain = 0.4},
-                dig = {name = "geopolitical_dig_metal", gain = 0.5},
-                dug = {name = "geopolitical_dug_metal", gain = 1.0}
-            }
-        end
-    }
-end
-local vector = vector
-local math = math
-local table = table
-local minetest = minetest
-
--- Configuration
-local GEOPOLITICAL = {
-    COUNTRIES = {
-        {name = "Redstonia", color = "red", spawn_pos = {x = 0, y = 10, z = 0}},
-        {name = "Emeraldia", color = "green", spawn_pos = {x = 100, y = 10, z = 0}},
-        {name = "Azurea", color = "blue", spawn_pos = {x = 0, y = 10, z = 100}},
-        {name = "Yellowtopia", color = "yellow", spawn_pos = {x = -100, y = 10, z = 0}},
-        {name = "Violetland", color = "violet", spawn_pos = {x = 0, y = 10, z = -100}},
-    },
-    PERKS = {
-        "speed_boost", "jump_boost", "health_boost", "mining_fast", 
-        "damage_resist", "night_vision", "water_breathing", "fall_resist"
-    },
-    ROLES = {
-        "soldier", "engineer", "diplomat", "spy", "merchant"
-    },
-    DIPLOMACY_STATES = {
-        "peace", "war", "trade", "non_aggression", "alliance"
-    }
-}
-
--- Global state
-geopolitical = {
-    players = {},
-    countries = {},
-    organizations = {},
-    diplomacy = {}
-}
-
--- Initialize countries
-for _, country_def in ipairs(GEOPOLITICAL.COUNTRIES) do
-    geopolitical.countries[country_def.name] = {
-        name = country_def.name,
-        color = country_def.color,
-        spawn_pos = country_def.spawn_pos,
-        president = nil,
-        members = {},
-        resources = {
-            gold = 1000,
-            iron = 5000,
-            food = 10000
-        },
-        alliances = {},
-        enemies = {}
-    }
-end
-
--- Initialize some organizations
-geopolitical.organizations = {
-    {
-        name = "United Builders",
-        description = "Organization dedicated to construction and architecture",
-        members = {},
-        cross_country = true
-    },
-    {
-        name = "Miner's Guild",
-        description = "Organization for miners and resource gatherers",
-        members = {},
-        cross_country = true
-    },
-    {
-        name = "Free Traders",
-        description = "Organization promoting free trade between nations",
-        members = {},
-        cross_country = true
-    }
-}
-
--- Helper functions
-local function get_random_perk()
-    return GEOPOLITICAL.PERKS[math.random(1, #GEOPOLITICAL.PERKS)]
-end
-
-local function get_random_role()
-    return GEOPOLITICAL.ROLES[math.random(1, #GEOPOLITICAL.ROLES)]
-end
-
-local function assign_perks(player)
-    local player_name = player:get_player_name()
-    if not geopolitical.players[player_name] then return end
-    
-    -- Clear old perks
-    for _, perk in ipairs(GEOPOLITICAL.PERKS) do
-        player:set_physics_override({[perk] = 1.0})
-    end
-    
-    -- Assign new perks
-    local num_perks = math.random(1, 3) -- 1-3 perks
-    local perks = {}
-    for i = 1, num_perks do
-        local perk = get_random_perk()
-        if not perks[perk] then -- Ensure unique perks
-            perks[perk] = true
-            -- Apply perk
-            if perk == "speed_boost" then
-                player:set_physics_override({speed = 1.5})
-            elseif perk == "jump_boost" then
-                player:set_physics_override({jump = 1.5})
-            elseif perk == "health_boost" then
-                player:set_properties({hp_max = 30})
-                player:set_hp(30)
-            elseif perk == "mining_fast" then
-                -- This would need to be handled with tools in reality
-            elseif perk == "damage_resist" then
-                -- Would need armor system integration
-            elseif perk == "night_vision" then
-                -- Would need client-side effect
-            elseif perk == "water_breathing" then
-                -- Would need breath system integration
-            elseif perk == "fall_resist" then
-                -- Would need fall damage modification
-            end
+local function reject_diplomacy_request(to_country, from_country, req_type, player_name)
+    local requests = pending_requests[to_country]
+    if not requests then return false end
+    for i, req in ipairs(requests) do
+        if req.from == from_country and req.type == req_type then
+            table.remove(requests, i)
+            minetest.chat_send_player(player_name, "Request rejected.")
+            return true
         end
     end
-    
-    geopolitical.players[player_name].perks = perks
+    return false
 end
-
-local function assign_country(player)
-    local player_name = player:get_player_name()
-    
-    -- Find country with fewest players
-    local min_count = math.huge
-    local selected_country = nil
-    
-    for _, country in pairs(geopolitical.countries) do
-        local member_count = #country.members
-        if member_count < min_count then
-            min_count = member_count
-            selected_country = country
-        end
-    end
-    
-    if selected_country then
-        -- Add player to country
-        table.insert(selected_country.members, player_name)
-        geopolitical.players[player_name] = {
-            country = selected_country.name,
-            role = (#selected_country.members == 1) and "president" or get_random_role(),
-            perks = {}
-        }
-        
-        -- If first member, make president
-        if #selected_country.members == 1 then
-            selected_country.president = player_name
-            minetest.chat_send_player(player_name, 
-                "Congratulations! You are the president of " .. selected_country.name .. "!")
-        else
-            minetest.chat_send_player(player_name, 
-                "You have joined " .. selected_country.name .. " as a " .. 
-                geopolitical.players[player_name].role)
-        end
-        
-        -- Teleport to country spawn
-        player:set_pos(selected_country.spawn_pos)
-        
-        -- Assign perks
-        assign_perks(player)
-    end
-end
-
-local function handle_respawn(player)
-    local player_name = player:get_player_name()
-    if geopolitical.players[player_name] then
-        -- Get player's country
-        local country_name = geopolitical.players[player_name].country
-        local country = geopolitical.countries[country_name]
-        
-        -- Teleport back to country spawn
-        player:set_pos(country.spawn_pos)
-        
-        -- Reassign perks (randomize on respawn)
-        assign_perks(player)
-        
-        minetest.chat_send_player(player_name, "Welcome back to " .. country_name .. "!")
-    end
-end
-
-local function show_country_info(player)
-    local player_name = player:get_player_name()
-    if not geopolitical.players[player_name] then return end
-    
-    local country_name = geopolitical.players[player_name].country
-    local country = geopolitical.countries[country_name]
-    
-    local info = "--- " .. country_name .. " ---\n"
-    info = info .. "President: " .. (country.president or "None") .. "\n"
-    info = info .. "Members: " .. #country.members .. "\n"
-    info = info .. "Resources:\n"
-    info = info .. "  Gold: " .. country.resources.gold .. "\n"
-    info = info .. "  Iron: " .. country.resources.iron .. "\n"
-    info = info .. "  Food: " .. country.resources.food .. "\n"
-    
-    info = info .. "Alliances: "
-    for _, ally in ipairs(country.alliances) do
-        info = info .. ally .. " "
-    end
-    info = info .. "\n"
-    
-    info = info .. "Enemies: "
-    for _, enemy in ipairs(country.enemies) do
-        info = info .. enemy .. " "
-    end
-    info = info .. "\n"
-    
-    info = info .. "Your role: " .. geopolitical.players[player_name].role .. "\n"
-    info = info .. "Your perks: "
-    for perk, _ in pairs(geopolitical.players[player_name].perks) do
-        info = info .. perk .. " "
-    end
-    
-    minetest.show_formspec(player_name, "geopolitical:country_info", 
-        "size[8,10]label[0.5,0.5;" .. minetest.formspec_escape(info) .. "]")
-end
-
--- Diplomacy functions
-local function propose_diplomacy(player, target_country, action)
-    local player_name = player:get_player_name()
-    if not geopolitical.players[player_name] then return end
-    
-    local source_country = geopolitical.players[player_name].country
-    local source_country_data = geopolitical.countries[source_country]
-    local target_country_data = geopolitical.countries[target_country]
-    
-    if not target_country_data then
-        minetest.chat_send_player(player_name, "Country not found!")
-        return
-    end
-    
-    -- Only presidents can propose diplomacy
-    if source_country_data.president ~= player_name then
-        minetest.chat_send_player(player_name, "Only the president can propose diplomacy!")
-        return
-    end
-    
-    -- Check if target country has a president
-    if not target_country_data.president then
-        minetest.chat_send_player(player_name, target_country .. " has no president to negotiate with!")
-        return
-    end
-    
-    -- Create diplomatic proposal
-    geopolitical.diplomacy[#geopolitical.diplomacy+1] = {
-        source = source_country,
-        target = target_country,
-        action = action,
-        status = "pending"
-    }
-    
-    minetest.chat_send_player(player_name, "Diplomatic proposal sent to " .. target_country)
-    minetest.chat_send_player(target_country_data.president, 
-        source_country .. " has proposed a " .. action .. " agreement. Type /diplomacy to respond.")
-end
-
-local function accept_diplomacy(player, proposal_index)
-    local player_name = player:get_player_name()
-    if not geopolitical.players[player_name] then return end
-    
-    local proposal = geopolitical.diplomacy[proposal_index]
-    if not proposal then return end
-    
-    local target_country = geopolitical.players[player_name].country
-    if proposal.target ~= target_country then
-        minetest.chat_send_player(player_name, "This proposal is not for your country!")
-        return
-    end
-    
-    local target_country_data = geopolitical.countries[target_country]
-    if target_country_data.president ~= player_name then
-        minetest.chat_send_player(player_name, "Only the president can accept diplomacy!")
-        return
-    end
-    
-    local source_country_data = geopolitical.countries[proposal.source]
-    
-    -- Implement the diplomatic action
-    if proposal.action == "peace" then
-        -- Remove from enemies if present
-        for i, enemy in ipairs(source_country_data.enemies) do
-            if enemy == target_country then
-                table.remove(source_country_data.enemies, i)
-                break
-            end
-        end
-        for i, enemy in ipairs(target_country_data.enemies) do
-            if enemy == proposal.source then
-                table.remove(target_country_data.enemies, i)
-                break
-            end
-        end
-    elseif proposal.action == "alliance" then
-        table.insert(source_country_data.alliances, target_country)
-        table.insert(target_country_data.alliances, proposal.source)
-    elseif proposal.action == "trade" then
-        -- Implement trade agreement
-    elseif proposal.action == "non_aggression" then
-        -- Implement non-aggression pact
-    end
-    
-    proposal.status = "accepted"
-    minetest.chat_send_player(player_name, "You have accepted the " .. proposal.action .. " with " .. proposal.source)
-    minetest.chat_send_player(source_country_data.president, 
-        target_country .. " has accepted your " .. proposal.action .. " proposal!")
-end
-
--- Chat commands
-minetest.register_chatcommand("country", {
-    description = "Show information about your country",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if player then
-            show_country_info(player)
-        end
-    end
+minetest.register_node("geopolitical:relations_block", {
+    description = "Country Relations Viewer",
+    tiles = {"default_paper.png"},
+    groups = {choppy=2, oddly_breakable_by_hand=2},
+    on_rightclick = function(pos, node, player)
+        local name = player:get_player_name()
+        local pdata = player_data[name]
+        local my_country = pdata and pdata.country or "None"
+        local country_str = table.concat(countries, ",")
+        minetest.show_formspec(name, "geopolitical:relations", relations_formspec(name, countries[1] or "None"))
+    end,
 })
 
-minetest.register_chatcommand("propose_alliance", {
-    params = "<country>",
-    description = "Propose an alliance with another country (president only)",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if player and param and param ~= "" then
-            propose_diplomacy(player, param, "alliance")
-        end
-    end
-})
-
-minetest.register_chatcommand("propose_peace", {
-    params = "<country>",
-    description = "Propose peace with another country (president only)",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if player and param and param ~= "" then
-            propose_diplomacy(player, param, "peace")
-        end
-    end
-})
-
-minetest.register_chatcommand("diplomacy", {
-    description = "View and respond to diplomatic proposals (president only)",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return end
-        
-        local player_name = name
-        if not geopolitical.players[player_name] then return end
-        
-        local country_name = geopolitical.players[player_name].country
-        local country = geopolitical.countries[country_name]
-        
-        if country.president ~= player_name then
-            minetest.chat_send_player(player_name, "Only the president can manage diplomacy!")
+-- Diplomacy Control Block (for managing diplomacy)
+minetest.register_node("geopolitical:diplomacy_block", {
+    description = "Diplomacy Block",
+    tiles = {"default_wood.png"},
+    groups = {choppy = 2, oddly_breakable_by_hand = 2},
+    on_rightclick = function(pos, node, player, itemstack, pointed_thing)
+        local name = player:get_player_name()
+        local pdata = player_data[name]
+        if not pdata or pdata.rank ~= "President" then
+            minetest.chat_send_player(name, "Only Presidents can use this.")
             return
         end
-        
-        local formspec = "size[8,10]label[0.5,0.5;Diplomatic Proposals]"
-        local y = 1.5
-        local proposals_shown = 0
-        
-        for i, proposal in ipairs(geopolitical.diplomacy) do
-            if proposal.target == country_name and proposal.status == "pending" then
-                formspec = formspec .. "label[0.5,"..y..";"..proposal.source.." proposes "..proposal.action.."]"
-                formspec = formspec .. "button[5,"..(y-0.2)..";2,1;accept_"..i..";Accept]"
-                formspec = formspec .. "button[7,"..(y-0.2)..";1,1;reject_"..i..";Reject]"
-                y = y + 1
-                proposals_shown = proposals_shown + 1
-            end
+
+        local your_country = pdata.country
+        local country_list = {}
+        for _, c in ipairs(countries) do
+            if c ~= your_country then table.insert(country_list, c) end
         end
-        
-        if proposals_shown == 0 then
-            formspec = formspec .. "label[0.5,1.5;No pending proposals]"
-        end
-        
-        minetest.show_formspec(player_name, "geopolitical:diplomacy", formspec)
-    end
+
+        local country_str = table.concat(country_list, ",")
+        local formspec = "size[7,6]" ..
+            "label[0,0;Your country: " .. your_country .. "]" ..
+            "dropdown[0,1;5,0.8;target_country;" .. country_str .. ";1]" ..
+            "dropdown[0,2;5,0.8;diplomatic_action;Alliance,Non-aggression pact,Army passage pact,Terminate alliance,Terminate non-aggression,Declare war;1]" ..
+            "button[0,3;3,1;send_request;Send]"
+
+        minetest.show_formspec(name, "geopolitical:diplomacy_ui", formspec)
+    end,
 })
 
--- Formspec handlers
-minetest.register_on_player_receive_fields(function(player, formname, fields)
-    if formname == "geopolitical:diplomacy" then
-        local player_name = player:get_player_name()
-        
-        for field, _ in pairs(fields) do
-            if field:sub(1, 7) == "accept_" then
-                local index = tonumber(field:sub(8))
-                accept_diplomacy(player, index)
-                return
-            elseif field:sub(1, 7) == "reject_" then
-                local index = tonumber(field:sub(8))
-                geopolitical.diplomacy[index].status = "rejected"
-                minetest.chat_send_player(player_name, "Proposal rejected")
-                return
+function diplomacy_formspec(player_name)
+    local pdata = player_data[player_name]
+    if not pdata then return "size[6,8]label[1,1;No data found]" end
+
+    local formspec = "size[8,10]label[0,0;Diplomacy Control - Your country: "..pdata.country.."]"
+
+    local y = 1.5
+    for i, c1 in ipairs(countries) do
+        for j, c2 in ipairs(countries) do
+            if i < j then
+                local status = diplomacy[c1][c2] or "peace"
+                local color = status == "peace" and "#00ff00" or
+                              status == "war" and "#ff0000" or
+                              status == "non_aggression" and "#ffff00" or
+                              status == "alliance" and "#0000ff" or
+                              status == "army_pass" and "#ff8800" or
+                              "#ffffff"
+
+                formspec = formspec .. string.format(
+                    "label[0,%f;%s - %s:]button[5,%f;1,0.5;%s_toggle;%s]",
+                    y, c1, c2, y, c1.."_"..c2, status:upper()
+                )
+                y = y + 0.6
             end
         end
     end
-end)
 
--- Event handlers
-minetest.register_on_newplayer(function(player)
-    assign_country(player)
-end)
-
-minetest.register_on_respawnplayer(function(player)
-    handle_respawn(player)
-    return true -- Override default respawn
-end)
-
-minetest.register_on_joinplayer(function(player)
-    local player_name = player:get_player_name()
-    if not geopolitical.players[player_name] then
-        assign_country(player)
-    else
-        -- Player already in system, just teleport to their country
-        local country_name = geopolitical.players[player_name].country
-        local country = geopolitical.countries[country_name]
-        player:set_pos(country.spawn_pos)
-    end
-end)
-
-minetest.register_on_dieplayer(function(player)
-    -- Clear any perks that might affect respawn
-    player:set_physics_override({speed = 1.0, jump = 1.0})
-    player:set_properties({hp_max = 20})
-end)
-
--- Initialize existing players (in case of server restart)
-minetest.after(0, function()
-    for _, player in ipairs(minetest.get_connected_players()) do
-        local player_name = player:get_player_name()
-        if not geopolitical.players[player_name] then
-            assign_country(player)
-        end
-    end
-end)
-
-minetest.log("action", "[Geopolitical] System initialized")
--- Repair System
--- Repair System Implementation
-
--- First, define our own nodes and sounds if default mod isn't available
-local S = minetest.get_translator("geopolitical")
-
-local repair_sounds = {}
-if minetest.get_modpath("default") then
-    repair_sounds = default.node_sound_metal_defaults()
-else
-    repair_sounds = {
-        footstep = {name = "geopolitical_metal_footstep", gain = 0.5},
-        dig = {name = "geopolitical_metal_dig", gain = 0.5},
-        dug = {name = "geopolitical_metal_dug", gain = 1.0},
-        place = {name = "geopolitical_metal_place", gain = 1.0}
-    }
-end
-
-
--- Add to your BUILDINGS table after existing definitions
-geopolitical.BUILDINGS = {
-    -- ... (your existing buildings) ...
-    
-    -- Military Buildings
-    {
-        id = "military_base",
-        name = "Military Base",
-        description = "Trains soldiers and enables advanced units",
-        cost = {gold = 500, iron = 1000, food = 200},
-        roles = {"engineer", "president"},
-        size = {x = 7, y = 4, z = 7},
-        node = "default:steelblock",
-        texture = "geopolitical_military_base.png",
-        tech_required = 1,
-        limit = 2,
-        bonus = {military = true}
-    },
-    {
-        id = "missile_silo",
-        name = "Missile Silo", 
-        description = "Allows construction of nuclear missiles",
-        cost = {gold = 1000, iron = 2000, food = 100},
-        roles = {"engineer", "president"},
-        size = {x = 5, y = 8, z = 5},
-        node = "default:obsidian",
-        texture = "geopolitical_missile_silo.png",
-        tech_required = 3,
-        requires = "military_base",
-        limit = 1,
-        bonus = {missiles = true}
-    },
-    {
-        id = "research_lab",
-        name = "Research Lab",
-        description = "Increases technology progression",
-        cost = {gold = 800, iron = 500, food = 300},
-        roles = {"engineer", "scientist"},
-        size = {x = 5, y = 4, z = 5},
-        node = "default:glass",
-        texture = "geopolitical_research_lab.png",
-        tech_required = 2,
-        limit = 1,
-        generate = {tech = 0.1} -- Generates tech points
-    }
-}
-
--- Technology System
-geopolitical.technology = {
-    levels = {
-        {level = 1, name = "Industrial", required_points = 100},
-        {level = 2, name = "Modern", required_points = 300},
-        {level = 3, name = "Nuclear", required_points = 800},
-        {level = 4, name = "Space Age", required_points = 1500}
-    },
-    recipes = {
-        nuclear_reactor = {
-            output = "geopolitical:nuclear_core",
-            secret = true,
-            recipe = {
-                {"geopolitical:uranium", "default:steelblock", "geopolitical:uranium"},
-                {"default:mese_crystal", "default:diamondblock", "default:mese_crystal"},
-                {"geopolitical:uranium", "default:steelblock", "geopolitical:uranium"}
-            },
-            tech_points = 50,
-            tech_required = 3
-        },
-        super_computer = {
-            output = "geopolitical:super_computer",
-            secret = true,
-            recipe = {
-                {"default:mese_crystal", "default:goldblock", "default:mese_crystal"},
-                {"default:diamond", "default:copper_ingot", "default:diamond"},
-                {"default:mese_crystal", "default:goldblock", "default:mese_crystal"}
-            },
-            tech_points = 30,
-            tech_required = 2
-        }
-    }
-}
-
--- Add to country initialization
-for _, country in pairs(geopolitical.countries) do
-    country.tech = {
-        level = 0,
-        points = 0,
-        unlocked = {}
-    }
-end
-
--- Technology crafting handler
-minetest.register_on_craft(function(itemstack, player, old_craft_grid, craft_inv)
-    local player_name = player:get_player_name()
-    local player_data = geopolitical.players[player_name]
-    if not player_data then return end
-    
-    local country = geopolitical.countries[player_data.country]
-    if not country then return end
-    
-    -- Check if crafted item is a tech recipe
-    for tech_id, recipe in pairs(geopolitical.technology.recipes) do
-        if itemstack:get_name() == recipe.output then
-            -- Check tech level requirement
-            if country.tech.level < recipe.tech_required then
-                minetest.chat_send_player(player_name, 
-                    "Technology level too low! Need level "..recipe.tech_required)
-                return itemstack -- Prevent crafting
-            end
-            
-            -- Award tech points
-            country.tech.points = country.tech.points + (recipe.tech_points or 0)
-            minetest.chat_send_player(player_name, 
-                "Earned "..(recipe.tech_points or 0).." tech points!")
-            
-            -- Check for level up
-            for _, level in ipairs(geopolitical.technology.levels) do
-                if country.tech.points >= level.required_points and 
-                   country.tech.level < level.level then
-                    country.tech.level = level.level
-                    minetest.chat_send_all(player_data.country.." has reached "..
-                        level.name.." technology!")
-                    break
-                end
-            end
-        end
-    end
-end)
-
--- Secret recipe discovery system
-minetest.register_on_player_receive_fields(function(player, formname, fields)
-    if formname == "geopolitical:research" then
-        local player_name = player:get_player_name()
-        local player_data = geopolitical.players[player_name]
-        if not player_data then return end
-        
-        local country = geopolitical.countries[player_data.country]
-        if not country then return end
-        
-        for tech_id, _ in pairs(fields) do
-            if geopolitical.technology.recipes[tech_id] and
-               country.tech.level >= geopolitical.technology.recipes[tech_id].tech_required then
-                country.tech.unlocked[tech_id] = true
-                minetest.chat_send_player(player_name, 
-                    "Discovered "..tech_id.." technology!")
-            end
-        end
-    end
-end)
-
--- Research command
-minetest.register_chatcommand("research", {
-    description = "View available research projects",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return false, "Player not found" end
-        
-        local player_data = geopolitical.players[name]
-        if not player_data then return false, "Player data not found" end
-        
-        local country = geopolitical.countries[player_data.country]
-        if not country then return false, "Country not found" end
-        
-        local formspec = "size[8,10]label[0.5,0.5;Research Projects]"..
-                         "label[0.5,1;Current Tech Level: "..country.tech.level.."]"..
-                         "label[0.5,1.5;Tech Points: "..country.tech.points.."]"
-        local y = 2
-        for tech_id, recipe in pairs(geopolitical.technology.recipes) do
-            if country.tech.level >= recipe.tech_required and
-               not country.tech.unlocked[tech_id] then
-                formspec = formspec.."button[0.5,"..y..";7,1;"..tech_id..";Research "..tech_id.."]"
-                y = y + 1
-            end
-        end
-        
-        minetest.show_formspec(name, "geopolitical:research", formspec)
-        return true
-    end
-})
-
--- Custom tech items
-minetest.register_craftitem("geopolitical:nuclear_core", {
-    description = "Nuclear Reactor Core\nHighly advanced technology",
-    inventory_image = "geopolitical_nuclear_core.png",
-    groups = {tech_item = 1, radioactive = 1}
-})
-
-minetest.register_craftitem("geopolitical:super_computer", {
-    description = "Super Computer\nIncreases research speed",
-    inventory_image = "geopolitical_super_computer.png",
-    groups = {tech_item = 1}
-})
-
-minetest.register_craftitem("geopolitical:uranium", {
-    description = "Uranium Ore\nHandle with care",
-    inventory_image = "geopolitical_uranium.png",
-    groups = {radioactive = 1}
-})
-
--- Register the repair kit node
-minetest.register_node("geopolitical:repair_kit", {
-    description = S("Building Repair Kit") .. "\n" .. S("Place in damaged building to repair"),
-    tiles = {"geopolitical_repair_kit.png"},
-    inventory_image = "geopolitical_repair_kit.png",
-    groups = {cracky = 1, level = 2, repair_kit = 1},
-    sounds = repair_sounds,
-    
-    on_place = function(itemstack, placer, pointed_thing)
-        -- Basic placement checks
-        if pointed_thing.type ~= "node" then return end
-        if not placer or not placer:is_player() then return end
-        
-        local pos = pointed_thing.under
-        local player_name = placer:get_player_name()
-        local player_data = geopolitical.players[player_name]
-        
-        -- Player validation
-        if not player_data then
-            minetest.chat_send_player(player_name, S("Error: Player data not found!"))
-            return
-        end
-        
-        -- Find building at this position
-        local building, building_def
-        for hash, b in pairs(geopolitical.building_health or {}) do
-            local bpos = minetest.get_position_from_hash(hash)
-            
-            -- Find building definition
-            local bdef
-            for _, def in ipairs(geopolitical.BUILDINGS or {}) do
-                if def.id == b.type then
-                    bdef = def
-                    break
-                end
-            end
-            if not bdef then goto continue end
-            
-            -- Calculate building bounds
-            local half_x = math.floor(bdef.size.x / 2)
-            local half_z = math.floor(bdef.size.z / 2)
-            
-            -- Check if position is within building bounds
-            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
-               pos.y >= bpos.y and pos.y <= bpos.y + bdef.size.y-1 and
-               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
-                building = b
-                building_def = bdef
-                break
-            end
-            ::continue::
-        end
-        
-        -- Building validation
-        if not building or not building_def then
-            minetest.chat_send_player(player_name, S("No building found at this location!"))
-            return
-        end
-        
-        -- Country permission check
-        if building.country ~= player_data.country then
-            minetest.chat_send_player(player_name, S("You can only repair your own country's buildings!"))
-            return
-        end
-        
-        -- Health check
-        local health_percent = (building.current_health / building.max_health) * 100
-        if health_percent >= 100 then
-            minetest.chat_send_player(player_name, S("This building doesn't need repair!"))
-            return
-        end
-        
-        -- Get country resources
-        local country = geopolitical.countries[player_data.country]
-        if not country or not country.resources then
-            minetest.chat_send_player(player_name, S("Error: Country data not found!"))
-            return
-        end
-        
-        -- Calculate and check repair cost
-        local repair_cost = math.max(1, math.floor((100 - health_percent) / 10)) -- At least 1 iron
-        if (country.resources.iron or 0) < repair_cost then
-            minetest.chat_send_player(player_name, 
-                S("Need @1 iron to repair this building (have @2)", repair_cost, country.resources.iron or 0))
-            return
-        end
-        
-        -- Perform repair
-        local nodes_repaired = 0
-        for _, node_pos in ipairs(building.nodes or {}) do
-            local node = minetest.get_node(node_pos)
-            if node.name ~= building_def.node then
-                minetest.set_node(node_pos, {name = building_def.node})
-                nodes_repaired = nodes_repaired + 1
-            end
-        end
-        
-        -- Update building and country data
-        country.resources.iron = (country.resources.iron or 0) - repair_cost
-        building.current_health = building.max_health
-        
-        -- Feedback
-        minetest.chat_send_player(player_name, 
-            S("Building repaired! Repaired @1 blocks for @2 iron. Now at 100% integrity.", 
-            nodes_repaired, repair_cost))
-        
-        -- Consume one repair kit
-        itemstack:take_item()
-        return itemstack
-    end
-})
--- Register building items for each building type
-for _, building_def in ipairs(geopolitical.BUILDINGS) do
-    minetest.register_node("geopolitical:building_"..building_def.id, {
-        description = building_def.name.."\n"..building_def.description,
-        tiles = {building_def.texture},
-        groups = {dig_immediate = 2, building_kit = 1},
-        stack_max = 1,
-        
-        on_place = function(itemstack, placer, pointed_thing)
-            if pointed_thing.type ~= "node" then return end
-            
-            local pos = pointed_thing.above
-            local player_name = placer:get_player_name()
-            local player_data = geopolitical.players[player_name]
-            
-            -- Check permissions
-            if not player_data then return end
-            if not table.contains(building_def.roles, player_data.role) then
-                minetest.chat_send_player(player_name, "Your role can't build this!")
-                return
-            end
-            
-            -- Check country resources
-            local country = geopolitical.countries[player_data.country]
-            for res, amount in pairs(building_def.cost) do
-                if (country.resources[res] or 0) < amount then
-                    minetest.chat_send_player(player_name, 
-                        "Not enough "..res.." (need "..amount..")")
-                    return
-                end
-            end
-            
-            -- Deduct resources
-            for res, amount in pairs(building_def.cost) do
-                country.resources[res] = country.resources[res] - amount
-            end
-            
-            -- Create building structure
-            local half_x = math.floor(building_def.size.x / 2)
-            local half_z = math.floor(building_def.size.z / 2)
-            
-            for x = -half_x, half_x do
-                for y = 0, building_def.size.y-1 do
-                    for z = -half_z, half_z do
-                        local place_pos = vector.add(pos, {x=x, y=y, z=z})
-                        
-                        -- Skip corners for door openings
-                        if not (x == 0 and z == 0 and y <= 1) then
-                            minetest.set_node(place_pos, {name=building_def.node})
-                        end
-                    end
-                end
-            end
-            
-            -- Add special nodes
-            minetest.set_node(pos, {name="air"}) -- Entrance
-            minetest.set_node(vector.add(pos, {y=1}), {name="air"}) -- Doorway
-            
-            minetest.chat_send_player(player_name, building_def.name.." built!")
-            itemstack:take_item()
-            return itemstack
-        end
-    })
-end
--- Craft recipe for repair kit (with fallbacks)
-local steel_ingot = minetest.registered_items["default:steel_ingot"] and "default:steel_ingot" or "geopolitical:steel_ingot"
-local gold_ingot = minetest.registered_items["default:gold_ingot"] and "default:gold_ingot" or "geopolitical:gold_ingot"
-
-minetest.register_craft({
-    output = "geopolitical:repair_kit",
-    recipe = {
-        {steel_ingot, steel_ingot, steel_ingot},
-        {steel_ingot, gold_ingot, steel_ingot},
-        {steel_ingot, steel_ingot, steel_ingot}
-    }
-})
-
--- Register fallback items if needed
-if not minetest.registered_items["default:steel_ingot"] then
-    minetest.register_craftitem("geopolitical:steel_ingot", {
-        description = S("Steel Ingot"),
-        inventory_image = "geopolitical_steel_ingot.png",
-    })
-end
-
-if not minetest.registered_items["default:gold_ingot"] then
-    minetest.register_craftitem("geopolitical:gold_ingot", {
-        description = S("Gold Ingot"),
-        inventory_image = "geopolitical_gold_ingot.png",
-    })
-end
-
--- Building info command
-minetest.register_chatcommand("building_info", {
-    params = "",
-    description = S("Check the integrity of a building you're standing in"),
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return false, S("Player not found") end
-        
-        local pos = vector.round(player:get_pos())
-        
-        -- Find building
-        local building, building_def
-        for hash, b in pairs(geopolitical.building_health or {}) do
-            local bpos = minetest.get_position_from_hash(hash)
-            
-            -- Find building definition
-            local bdef
-            for _, def in ipairs(geopolitical.BUILDINGS or {}) do
-                if def.id == b.type then
-                    bdef = def
-                    break
-                end
-            end
-            if not bdef then goto continue end
-            
-            -- Calculate bounds
-            local half_x = math.floor(bdef.size.x / 2)
-            local half_z = math.floor(bdef.size.z / 2)
-            
-            -- Check position
-            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
-               pos.y >= bpos.y and pos.y <= bpos.y + bdef.size.y-1 and
-               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
-                building = b
-                building_def = bdef
-                break
-            end
-            ::continue::
-        end
-        
-        if not building or not building_def then
-            return false, S("You're not inside any building")
-        end
-        
-        -- Calculate health and status
-        local health_percent = (building.current_health / building.max_health) * 100
-        local status_msg, status_color
-        
-        if health_percent >= 90 then
-            status_msg = S("Excellent condition")
-            status_color = "#00FF00" -- Green
-        elseif health_percent >= 70 then
-            status_msg = S("Good condition")
-            status_color = "#00FFFF" -- Cyan
-        elseif health_percent >= 50 then
-            status_msg = S("Damaged")
-            status_color = "#FFFF00" -- Yellow
-        elseif health_percent >= 30 then
-            status_msg = S("Heavily damaged")
-            status_color = "#FFA500" -- Orange
-        elseif health_percent >= 20 then
-            status_msg = S("Critical condition")
-            status_color = "#FF0000" -- Red
-        else
-            status_msg = S("Non-functional")
-            status_color = "#800000" -- Dark Red
-        end
-        
-        return true, string.format(
-            "%s: %.1f%%\n%s: <color=%s>%s</color>\n%s: %d %s",
-            S("Integrity"), health_percent,
-            S("Status"), status_color, status_msg,
-            S("Repair cost"), math.floor((100 - health_percent) / 10), S("iron")
+    -- Pending requests section for player's country
+    local pend = pending_requests[pdata.country] or {}
+    formspec = formspec .. "label[0,"..(y+0.2)..";Pending Requests:]"
+    local y2 = y + 1
+    for i, req in ipairs(pend) do
+        formspec = formspec .. string.format(
+            "label[0,%f;%s requests %s]",
+            y2, req.from, req.type
         )
+        formspec = formspec .. string.format(
+            "button[4,%f;1,0.5;accept_%d;Accept]",
+            y2, i
+        )
+        formspec = formspec .. string.format(
+            "button[5,%f;1,0.5;reject_%d;Reject]",
+            y2, i
+        )
+        y2 = y2 + 0.6
     end
+
+    return formspec
+end
+
+minetest.register_on_player_receive_fields(function(player, formname, fields)
+    local name = player:get_player_name()
+    local pdata = player_data[name]
+    if not pdata then return end
+
+    -- Handle Relations Viewer UI
+    if formname == "geopolitical:relations" then
+        for k, v in pairs(fields) do
+            if k == "country" then
+                minetest.show_formspec(name, "geopolitical:relations", relations_formspec(name, v))
+                return
+            end
+        end
+    end
+
+    -- Handle Diplomacy UI (sending requests)
+    if formname == "geopolitical:diplomacy_ui" then
+        if pdata.rank ~= "President" then
+            minetest.chat_send_player(name, "Only Presidents can use diplomacy.")
+            return
+        end
+
+        if fields.send_request and fields.target_country and fields.diplomatic_action then
+            local from = pdata.country
+            local to = fields.target_country
+            local action = fields.diplomatic_action
+
+            if from == to then
+                minetest.chat_send_player(name, "You cannot target your own country.")
+                return
+            end
+
+            local map = {
+                ["Alliance"] = "alliance",
+                ["Non-aggression pact"] = "non_aggression",
+                ["Army passage pact"] = "army_pass",
+                ["Terminate alliance"] = "remove_alliance",
+                ["Terminate non-aggression"] = "remove_non_aggression",
+                ["Declare war"] = "war"
+            }
+
+            local action_code = map[action]
+            if not action_code then
+                minetest.chat_send_player(name, "Invalid action.")
+                return
+            end
+
+            if action_code == "war" then
+                diplomacy[from][to] = "war"
+                diplomacy[to][from] = "war"
+                minetest.chat_send_all("[Diplomacy] "..from.." has declared WAR on "..to.."!")
+            elseif action_code == "remove_alliance" then
+                if diplomacy[from][to] == "alliance" then
+                    diplomacy[from][to] = "peace"
+                    diplomacy[to][from] = "peace"
+                    minetest.chat_send_all("[Diplomacy] "..from.." has terminated its alliance with "..to..".")
+                else
+                    minetest.chat_send_player(name, "No alliance exists to terminate.")
+                end
+            elseif action_code == "remove_non_aggression" then
+                if diplomacy[from][to] == "non_aggression" then
+                    diplomacy[from][to] = "peace"
+                    diplomacy[to][from] = "peace"
+                    minetest.chat_send_all("[Diplomacy] "..from.." has ended the non-aggression pact with "..to..".")
+                else
+                    minetest.chat_send_player(name, "No non-aggression pact exists.")
+                end
+            else
+                add_request(to, from, action_code)
+                minetest.chat_send_player(name, "Request sent to "..to.." for: "..action_code)
+            end
+        end
+        return
+    end
+
+    -- Handle Diplomacy Request Viewer (for receiving/accepting/rejecting)
+    if formname == "geopolitical:diplomacy" then
+        if pdata.rank ~= "President" then
+            minetest.chat_send_player(name, "Only Presidents can handle diplomacy.")
+            return
+        end
+
+        for key, _ in pairs(fields) do
+            -- Accepting request
+            if key:match("^accept_%d+$") then
+                local idx = tonumber(key:match("^accept_(%d+)$"))
+                local pend = pending_requests[pdata.country] or {}
+                local req = pend[idx]
+                if req then
+                    accept_diplomacy_request(pdata.country, req.from, req.type, name)
+                end
+                minetest.show_formspec(name, "geopolitical:diplomacy", diplomacy_formspec(name))
+                return
+
+            -- Rejecting request
+            elseif key:match("^reject_%d+$") then
+                local idx = tonumber(key:match("^reject_(%d+)$"))
+                local pend = pending_requests[pdata.country] or {}
+                local req = pend[idx]
+                if req then
+                    reject_diplomacy_request(pdata.country, req.from, req.type, name)
+                end
+                minetest.show_formspec(name, "geopolitical:diplomacy", diplomacy_formspec(name))
+                return
+            end
+        end
+    end
+end)
+
+
+
+minetest.register_node("geopolitical:tech_upgrade_block", {
+    description = "Tech Upgrade Block",
+    tiles = {"default_gold_block.png"},
+    groups = {cracky=2, oddly_breakable_by_hand=2},
+    on_construct = function(pos)
+        local meta = minetest.get_meta(pos)
+        meta:set_string("infotext", "Tech Upgrade Block (Insert gold to upgrade your country's tech level)")
+        meta:set_int("upgrade_cost", 1) -- cost in gold per upgrade (change later)
+    end,
+    on_receive_fields = function(pos, formname, fields, sender)
+        -- Optional: implement form for upgrades if needed
+    end,
+    on_metadata_inventory_put = function(pos, listname, index, stack, player)
+        local name = player:get_player_name()
+        local pdata = player_data[name]
+        if not pdata then
+            minetest.chat_send_player(name, "No geopolitical data assigned.")
+            return
+        end
+        if pdata.rank ~= "President" then
+            minetest.chat_send_player(name, "Only Presidents can upgrade tech.")
+            return
+        end
+
+        -- Check inserted item is gold lump
+local allowed_ores = {
+    ["default:gold_lump"] = 1,
+    ["default:diamond"] = 3,
+    ["default:mese_crystal"] = 5,
+}
+
+local ore_value = allowed_ores[stack:get_name()]
+if not ore_value then
+    minetest.chat_send_player(name, "Only certain ores can be used to upgrade tech.")
+    return
+end
+
+local total_value = ore_value * stack:get_count()
+country_tech_levels[pdata.country] = (country_tech_levels[pdata.country] or 1) + total_value
+
+minetest.chat_send_all("[Tech] " .. pdata.country .. " tech level increased to " .. country_tech_levels[pdata.country])
+
+    end,
+    on_metadata_inventory_move = function() end,
+    on_metadata_inventory_take = function() end,
+    on_metadata_inventory_list = function() end,
 })
-minetest.register_node("geopolitical:repair_kit", {
-    description = "Building Repair Kit\nPlace in damaged building to repair",
-    tiles = {"default_tool_steelpick.png"},
-    groups = {cracky = 1, level = 2},
-    sounds = default.node_sound_metal_defaults(),
-    
-    on_place = function(itemstack, placer, pointed_thing)
-        if pointed_thing.type ~= "node" then return end
-        
-        local pos = pointed_thing.under
-        local player_name = placer:get_player_name()
-        local player_data = geopolitical.players[player_name]
-        
-        if not player_data then return end
-        
-        -- Find building at this position
-        local building
-        for hash, b in pairs(geopolitical.building_health) do
-            local bpos = minetest.get_position_from_hash(hash)
-            local half_x = math.floor(geopolitical.BUILDINGS[b.type].size.x / 2)
-            local half_z = math.floor(geopolitical.BUILDINGS[b.type].size.z / 2)
-            
-            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
-               pos.y >= bpos.y and pos.y <= bpos.y + geopolitical.BUILDINGS[b.type].size.y-1 and
-               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
-                building = b
-                break
-            end
+
+
+-- Relations Info Block
+
+minetest.register_node("geopolitical:relations_block", {
+    description = "Country Relations Info Block",
+    tiles = {"default_stone.png"},
+    groups = {cracky=2, oddly_breakable_by_hand=2},
+    on_construct = function(pos)
+        local meta = minetest.get_meta(pos)
+        meta:set_string("formspec", relations_formspec(nil))
+        meta:set_string("infotext", "Relations Info Block")
+    end,
+    on_rightclick = function(pos, node, clicker, itemstack, pointed_thing)
+        local name = clicker:get_player_name()
+        minetest.show_formspec(name, "geopolitical:relations", relations_formspec(name))
+    end,
+})
+
+-- Relations form: choose country to inspect and show relations with your country
+function relations_formspec(player_name, selected_country)
+    selected_country = selected_country or countries[1]
+    local pdata = player_data[player_name]
+    local my_country = pdata and pdata.country or "None"
+    local formspec = "size[8,10]label[0,0;Relations Info]dropdown[0,0.5;4,1;country;"..table.concat(countries, ",")..";"..(table.indexof(countries, selected_country) or 1).."]"
+    formspec = formspec .. string.format("label[0,1.8;Your country: %s]", my_country)
+    formspec = formspec .. "label[0,2.4;Relations with "..selected_country..":]"
+
+    for _, c in ipairs(countries) do
+        if c ~= selected_country then
+            local rel = diplomacy[selected_country][c] or "peace"
+            formspec = formspec .. string.format("label[0,%f;%s - %s: %s]", 2.4 + 0.6 * _, selected_country, c, rel)
         end
-        
-        if not building then
-            minetest.chat_send_player(player_name, "No building found at this location!")
-            return
+    end
+
+    if my_country ~= "None" then
+        local my_rel = diplomacy[my_country][selected_country] or "peace"
+        formspec = formspec .. string.format("label[0,9;Your country (%s) status with %s: %s]", my_country, selected_country, my_rel)
+    end
+
+    return formspec
+end
+
+
+
+-- Tech Trees (you can extend and hook effects)
+
+minetest.register_chatcommand("techs", {
+    description = "Show your country's tech tree",
+    func = function(name)
+        local pdata = player_data[name]
+        if not pdata then
+            return false, "No data."
         end
-        
-        -- Check if player is from the same country
-        if building.country ~= player_data.country then
-            minetest.chat_send_player(player_name, "You can only repair your own country's buildings!")
-            return
+        local tech = tech_trees[pdata.country]
+        if not tech then
+            return false, "No tech tree for your country."
         end
-        
-        -- Check if building needs repair
-        local health_percent = (building.current_health / building.max_health) * 100
-        if health_percent >= 100 then
-            minetest.chat_send_player(player_name, "This building doesn't need repair!")
-            return
+        local unlocked = tech.unlocked
+        local lines = {"Unlocked techs:"}
+        for _, t in ipairs(unlocked) do
+            lines[#lines+1] = "- " .. t .. ": " .. tech.techs[t].desc
         end
-        
-        -- Get building definition
-        local building_def
-        for _, def in ipairs(geopolitical.BUILDINGS) do
-            if def.id == building.type then
-                building_def = def
-                break
-            end
-        end
-        
-        if not building_def then return end
-        
-        -- Repair the building
-        local repair_cost = math.floor((100 - health_percent) / 10) -- 1 iron per 10% missing
-        local country = geopolitical.countries[player_data.country]
-        
-        if country.resources.iron < repair_cost then
-            minetest.chat_send_player(player_name, 
-                "Need "..repair_cost.." iron to repair this building (have "..country.resources.iron..")")
-            return
-        end
-        
-        -- Deduct resources
-        country.resources.iron = country.resources.iron - repair_cost
-        
-        -- Restore all building blocks
-        for _, node_pos in ipairs(building.nodes) do
-            local node = minetest.get_node(node_pos)
-            local expected_node = building_def.node
-            
-            -- Special cases for certain buildings
-            if building.type == "port" then
-                expected_node = "default:wood"
-            elseif building.type == "missile_silo" then
-                expected_node = "default:obsidian"
-            elseif building.type == "military_base" then
-                expected_node = "default:steelblock"
-            elseif building.type == "trade_center" then
-                expected_node = "default:goldblock"
-            end
-            
-            if node.name ~= expected_node then
-                minetest.set_node(node_pos, {name=expected_node})
-            end
-        end
-        
-        -- Update building health
-        building.current_health = building.max_health
-        
-        minetest.chat_send_player(player_name, 
-            "Building repaired for "..repair_cost.." iron! Now at 100% integrity.")
-        
-        -- Consume one repair kit
-        itemstack:take_item()
-        return itemstack
+        return true, table.concat(lines, "\n")
     end
 })
 
--- Craft recipe for repair kit
-minetest.register_craft({
-    output = "geopolitical:repair_kit",
-    recipe = {
-        {"default:steel_ingot", "default:steel_ingot", "default:steel_ingot"},
-        {"default:steel_ingot", "default:gold_ingot", "default:steel_ingot"},
-        {"default:steel_ingot", "default:steel_ingot", "default:steel_ingot"}
-    }
-})
+-- For unlocking techs, you can add commands or gameplay triggers
 
--- Add building integrity info to /buildings command
-minetest.register_chatcommand("building_info", {
-    params = "",
-    description = "Check the integrity of a building you're standing in",
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return false, "Player not found" end
-        
-        local pos = player:get_pos()
-        pos.x = math.floor(pos.x + 0.5)
-        pos.y = math.floor(pos.y + 0.5)
-        pos.z = math.floor(pos.z + 0.5)
-        
-        -- Find building at this position
-        local building
-        for hash, b in pairs(geopolitical.building_health) do
-            local bpos = minetest.get_position_from_hash(hash)
-            local half_x = math.floor(geopolitical.BUILDINGS[b.type].size.x / 2)
-            local half_z = math.floor(geopolitical.BUILDINGS[b.type].size.z / 2)
-            
-            if pos.x >= bpos.x - half_x and pos.x <= bpos.x + half_x and
-               pos.y >= bpos.y and pos.y <= bpos.y + geopolitical.BUILDINGS[b.type].size.y-1 and
-               pos.z >= bpos.z - half_z and pos.z <= bpos.z + half_z then
-                building = b
-                break
-            end
-        end
-        
-        if not building then
-            return false, "You're not inside any building"
-        end
-        
-        local building_def
-        for _, def in ipairs(geopolitical.BUILDINGS) do
-            if def.id == building.type then
-                building_def = def
-                break
-            end
-        end
-        
-        if not building_def then return false, "Building type not found" end
-        
-        local health_percent = (building.current_health / building.max_health) * 100
-        local status_msg
-        
-        if health_percent >= 90 then
-            status_msg = "§aExcellent condition"
-        elseif health_percent >= 70 then
-            status_msg = "§bGood condition"
-        elseif health_percent >= 50 then
-            status_msg = "§eDamaged"
-        elseif health_percent >= 30 then
-            status_msg = "§6Heavily damaged"
-        elseif health_percent >= 20 then
-            status_msg = "§cCritical condition"
-        else
-            status_msg = "§4Non-functional"
-        end
-        
-        return true, string.format("%s Integrity: %.1f%%\n%s\nRepair cost: %d iron",
-            building_def.name, health_percent, status_msg,
-            math.floor((100 - health_percent) / 10))
-    end
-})
+
