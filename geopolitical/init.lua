@@ -107,6 +107,114 @@ for _, c in ipairs(countries) do
         }
     }
 end
+
+local function build_base(pos)
+    local base_nodes = {
+        {x=0, y=0, z=0, node="default:stone"},
+        {x=1, y=0, z=0, node="default:stone"},
+        {x=0, y=0, z=1, node="default:stone"},
+        {x=1, y=0, z=1, node="default:stone"},
+        {x=0, y=1, z=0, node="default:glass"},
+        {x=1, y=1, z=0, node="default:glass"},
+        {x=0, y=1, z=1, node="default:glass"},
+        {x=1, y=1, z=1, node="default:glass"},
+    }
+    for _, b in ipairs(base_nodes) do
+        local p = vector.add(pos, b)
+        minetest.set_node(p, {name = b.node})
+    end
+end
+
+minetest.register_tool("geopolitical:base_tool", {
+    description = "Deployable Base Tool",
+    inventory_image = "default_tool_steelaxe.png",
+    on_use = function(itemstack, user, pointed_thing)
+        if pointed_thing.type ~= "node" then return end
+        local pos = vector.add(pointed_thing.under, {x=0, y=1, z=0})
+        build_base(pos)
+        minetest.chat_send_player(user:get_player_name(), "[Geopolitical] Base deployed.")
+    end
+})
+
+-- Trench Deployment Tool (actual sand & dirt used)
+local function build_trench(pos, material)
+    local node = material == "sand" and "default:sand" or "default:dirt"
+    for dx = -1,1 do
+        for dz = -1,1 do
+            local p = vector.add(pos, {x=dx, y=0, z=dz})
+            minetest.remove_node(p)
+            minetest.set_node(p, {name = node})
+        end
+    end
+end
+
+minetest.register_tool("geopolitical:trench_tool_dirt", {
+    description = "Dirt Trench Tool",
+    inventory_image = "default_tool_bronzepick.png",
+    on_use = function(itemstack, user, pointed_thing)
+        if pointed_thing.type ~= "node" then return end
+        build_trench(pointed_thing.under, "dirt")
+        minetest.chat_send_player(user:get_player_name(), "[Geopolitical] Dirt trench built.")
+    end
+})
+
+minetest.register_tool("geopolitical:trench_tool_sandbag", {
+    description = "Sandbag Trench Tool",
+    inventory_image = "default_tool_bronzepick.png^[colorize:#ddddaa:80",
+    on_use = function(itemstack, user, pointed_thing)
+        if pointed_thing.type ~= "node" then return end
+        build_trench(pointed_thing.under, "sand")
+        minetest.chat_send_player(user:get_player_name(), "[Geopolitical] Sandbag trench built.")
+    end
+})
+
+-- Missile Launch UI
+local function missile_launch_formspec(player_name)
+    return [[
+        size[6,4]
+        label[0,0;Missile Launch Terminal]
+        label[0,1;Currently simulated with dirt blocks.]
+        button[0,2;5,1;buy_dirt;Simulate Launch (Get Dirt)]
+    ]]
+end
+
+-- Missile Control Panel Node
+minetest.register_node("geopolitical:missile_terminal", {
+    description = "Missile Control Terminal",
+    tiles = {"default_steel_block.png"},
+    groups = {cracky=1},
+    on_rightclick = function(pos, node, clicker)
+        local name = clicker:get_player_name()
+        minetest.show_formspec(name, "geopolitical:missile_ui", missile_launch_formspec(name))
+    end
+})
+
+-- Silo Builder Tool
+local function build_missile_silo(pos)
+    for dx = -2, 2 do
+        for dz = -2, 2 do
+            for dy = 0, 4 do
+                local p = vector.add(pos, {x=dx, y=dy, z=dz})
+                local wall = (math.abs(dx) == 2 or math.abs(dz) == 2)
+                local node = (dy == 4) and "default:glass" or (wall and "default:stone" or "air")
+                minetest.set_node(p, {name = node})
+            end
+        end
+    end
+    -- Place terminal inside
+    minetest.set_node(vector.add(pos, {x=0, y=1, z=0}), {name="geopolitical:missile_terminal"})
+end
+
+minetest.register_tool("geopolitical:missile_silo_tool", {
+    description = "Missile Silo Builder",
+    inventory_image = "default_tool_mese.png",
+    on_use = function(itemstack, user, pointed_thing)
+        if pointed_thing.type ~= "node" then return end
+        local pos = vector.add(pointed_thing.under, {x=0, y=1, z=0})
+        build_missile_silo(pos)
+        minetest.chat_send_player(user:get_player_name(), "[Geopolitical] Missile silo constructed.")
+    end
+})
 function relations_formspec(player_name, selected_country)
     local pdata = player_data[player_name]
     local my_country = pdata and pdata.country or "None"
@@ -670,6 +778,71 @@ minetest.register_chatcommand("techs", {
     end
 })
 
--- For unlocking techs, you can add commands or gameplay triggers
+
+-- Tech Tree Expansion
+if not tech_trees then tech_trees = {} end
+for _, c in ipairs(countries or {}) do
+    tech_trees[c] = tech_trees[c] or { unlocked={}, techs={} }
+    tech_trees[c].techs["missiles"] = {
+        desc = "Unlock long-range missiles.",
+        unlock_cost = 10
+    }
+    tech_trees[c].techs["trenches"] = {
+        desc = "Allow construction of trenches.",
+        unlock_cost = 3
+    }
+    tech_trees[c].techs["outposts"] = {
+        desc = "Enable deployment of small outposts.",
+        unlock_cost = 5
+    }
+end
+
+-- Presidential Dashboard Block
+minetest.register_node("geopolitical:dashboard_block", {
+    description = "Presidential Dashboard",
+    tiles = {"default_meselamp.png"},
+    groups = {cracky=1},
+    on_rightclick = function(pos, node, clicker)
+        local name = clicker:get_player_name()
+        minetest.show_formspec(name, "geopolitical:dashboard", geopolitical.dashboard_formspec(name))
+    end
+})
+
+geopolitical = geopolitical or {}
+function geopolitical.dashboard_formspec(name)
+    local pdata = player_data[name]
+    if not pdata or pdata.rank ~= "President" then
+        return "size[6,3]label[0,1;Access denied. Presidents only.]"
+    end
+    local c = pdata.country
+    local tech = country_tech_levels[c] or 1
+    local pend = pending_requests[c] or {}
+
+    local fs = "size[9,9]label[0,0;President Dashboard for "..c.."]" ..
+        "label[0,1;Tech Level: "..tech.."]" ..
+        "label[0,1.5;Unlocked Techs:]"
+
+    local y = 2
+    for _, t in ipairs(tech_trees[c].unlocked or {}) do
+        fs = fs .. "label[0,"..y..";- "..t.."]"
+        y = y + 0.4
+    end
+
+    fs = fs .. "label[5,1.5;Pending Diplomacy:]"
+    for i, req in ipairs(pend) do
+        fs = fs .. string.format("label[5,%f;%s -> %s (%s)]", 1.9 + i * 0.5, req.from, c, req.type)
+    end
+
+    return fs
+end
+
+-- Handle missile UI response
+minetest.register_on_player_receive_fields(function(player, formname, fields)
+    if formname == "geopolitical:missile_ui" and fields.buy_dirt then
+        local inv = player:get_inventory()
+        inv:add_item("main", "default:dirt")
+        minetest.chat_send_player(player:get_player_name(), "[Silo] Missile simulated: 1x dirt received.")
+    end
+end)
 
 
